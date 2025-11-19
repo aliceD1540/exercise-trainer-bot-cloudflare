@@ -1,0 +1,23 @@
+{
+  "name": "exercise-trainer-bot-cloudflare",
+  "version": "1.0.0",
+  "description": "Exercise trainer bot for Bluesky running on Cloudflare Workers",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "wrangler dev --test-scheduled",
+    "tail": "wrangler tail"
+  },
+  "keywords": ["bluesky", "bot", "cloudflare-workers", "gemini"],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "^4.49.0"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.18.1",
+    "@google/generative-ai": "^0.24.1"
+  }
+}

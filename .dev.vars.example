@@ -1,0 +1,9 @@
+# Bluesky認証情報
+BSKY_USER_NAME=your-username.bsky.social
+BSKY_APP_PASS=your-app-password
+
+# 監視対象ユーザーのDID
+CHECK_BSKY_DID=did:plc:xxxxxxxxxxxxxxxxxxxxx
+
+# Google Gemini API
+GOOGLE_API_KEY=your-gemini-api-key
