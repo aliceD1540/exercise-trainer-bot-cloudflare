@@ -73,14 +73,20 @@ async function handleScheduled(env) {
 		until,
 	});
 
-	console.log('Found posts:', posts.posts.length);
+	// APIレスポンスの構造を修正: posts.data.posts
+	if (!posts || !posts.data || !posts.data.posts || !Array.isArray(posts.data.posts)) {
+		console.log('No posts found or invalid response structure');
+		return;
+	}
+
+	console.log('Found posts:', posts.data.posts.length);
 
 	// 処理済みポストのURIを取得
 	const processedPosts = await getProcessedPosts(env);
 	console.log('Previously processed posts:', processedPosts.size);
 
 	let newPostsCount = 0;
-	for (const post of posts.posts) {
+	for (const post of posts.data.posts) {
 		// 既に処理済みのポストはスキップ
 		if (processedPosts.has(post.uri)) {
 			console.log('Skipping already processed post:', post.uri);
@@ -121,16 +127,13 @@ async function handleScheduled(env) {
 
 async function analyzeWithGemini(postData, env) {
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
-	const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp-lite' });
+	const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
 	const now = new Date();
 	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
 	const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
 
 	const prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
-
-	console.log('--- Prompt for Gemini ---');
-	console.log(prompt);
 
 	// 画像がある場合は画像も含めて送信
 	const parts = [{ text: prompt }];
@@ -165,9 +168,6 @@ async function analyzeWithGemini(postData, env) {
 			responseText = responseText.substring(0, lastPeriod + 1);
 		}
 	}
-
-	console.log('--- Gemini Response ---');
-	console.log(responseText);
 
 	return responseText;
 }
@@ -233,7 +233,6 @@ async function cleanupOldProcessedPosts(env) {
 		
 		if (recentPosts.length !== posts.length) {
 			await env.EXERCISE_TRAINER_SESSIONS.put('processed_posts', JSON.stringify(recentPosts));
-			console.log(`Cleaned up ${posts.length - recentPosts.length} old processed post records`);
 		}
 	} catch (error) {
 		console.error('Error cleaning up processed posts:', error);

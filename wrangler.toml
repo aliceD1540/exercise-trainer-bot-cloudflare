@@ -17,3 +17,10 @@ preview_id = "402fd3b549a548eeac389131f031c324"
 # BSKY_APP_PASS
 # CHECK_BSKY_DID
 # GOOGLE_API_KEY
+
+[observability]
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true

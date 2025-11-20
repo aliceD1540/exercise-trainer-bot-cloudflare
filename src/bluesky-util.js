@@ -87,7 +87,13 @@ export class BlueskyUtil {
 
 		console.log('Search params:', params);
 
-		return await this.agent.app.bsky.feed.searchPosts(params);
+		try {
+			const result = await this.agent.app.bsky.feed.searchPosts(params);
+			return result;
+		} catch (error) {
+			console.error('Search posts error:', error);
+			return { data: { posts: [] } };
+		}
 	}
 
 	async getProfile(did) {
