@@ -11,14 +11,14 @@ export class BlueskyUtil {
 	async saveSession() {
 		const session = this.agent.session;
 		if (session) {
-			await this.env.SESSIONS.put('bsky_session', JSON.stringify(session));
+			await this.env.EXERCISE_TRAINER_SESSIONS.put('bsky_session', JSON.stringify(session));
 		}
 	}
 
 	async loadSession() {
 		try {
 			console.log('Trying to reload session...');
-			const sessionStr = await this.env.SESSIONS.get('bsky_session');
+			const sessionStr = await this.env.EXERCISE_TRAINER_SESSIONS.get('bsky_session');
 			
 			if (sessionStr) {
 				const session = JSON.parse(sessionStr);

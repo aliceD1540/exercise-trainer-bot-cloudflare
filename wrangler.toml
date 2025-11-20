@@ -8,9 +8,9 @@ crons = ["*/5 * * * *"]
 
 # KV Namespace for session storage
 [[kv_namespaces]]
-binding = "SESSIONS"
-id = "your-kv-namespace-id"
-preview_id = "your-preview-kv-namespace-id"
+binding = "EXERCISE_TRAINER_SESSIONS"
+id = "10ae465b6c2c4deda56fc1c3be063f06"
+preview_id = "402fd3b549a548eeac389131f031c324"
 
 # Environment variables (set via wrangler secret put)
 # BSKY_USER_NAME
