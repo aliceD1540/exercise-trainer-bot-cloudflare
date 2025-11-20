@@ -58,19 +58,16 @@ async function handleScheduled(env) {
 	const bsky = new BlueskyUtil(env);
 	await bsky.loadSession();
 
-	// 現在時刻を5分単位に丸めて、5分前と10分前を計算
+	// 現在時刻から24時間前まで検索範囲を拡大
 	const now = new Date();
-	const nowRounded = new Date(now);
-	nowRounded.setMinutes(Math.floor(now.getMinutes() / 5) * 5, 0, 0);
-	
-	const since = new Date(nowRounded.getTime() - 12 * 60 * 60 * 1000).toISOString();
-	const until = nowRounded.toISOString();
+	const since = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+	const until = now.toISOString();
 
 	console.log('Searching posts:', { since, until });
 
 	const posts = await bsky.searchPosts({
 		query: '#青空筋トレ部',
-		limit: 10,
+		limit: 50, // 24時間分なので増加
 		author: env.CHECK_BSKY_DID,
 		since,
 		until,
@@ -78,7 +75,18 @@ async function handleScheduled(env) {
 
 	console.log('Found posts:', posts.posts.length);
 
+	// 処理済みポストのURIを取得
+	const processedPosts = await getProcessedPosts(env);
+	console.log('Previously processed posts:', processedPosts.size);
+
+	let newPostsCount = 0;
 	for (const post of posts.posts) {
+		// 既に処理済みのポストはスキップ
+		if (processedPosts.has(post.uri)) {
+			console.log('Skipping already processed post:', post.uri);
+			continue;
+		}
+
 		try {
 			const postData = {
 				text: post.record.text,
@@ -95,11 +103,20 @@ async function handleScheduled(env) {
 			const responseText = await analyzeWithGemini(postData, env);
 			await bsky.postReply(responseText, post.uri, post.cid);
 			
+			// 処理完了後、KVに記録
+			await markPostAsProcessed(post.uri, env);
+			newPostsCount++;
+			
 			console.log('Replied to post:', post.uri);
 		} catch (error) {
 			console.error('Error processing post:', error);
 		}
 	}
+	
+	console.log('Processed new posts:', newPostsCount);
+	
+	// 古い処理済み記録をクリーンアップ（7日以上前の記録を削除）
+	await cleanupOldProcessedPosts(env);
 }
 
 async function analyzeWithGemini(postData, env) {
@@ -163,4 +180,62 @@ function arrayBufferToBase64(buffer) {
 		binary += String.fromCharCode(bytes[i]);
 	}
 	return btoa(binary);
+}
+
+// 処理済みポストのURIを取得
+async function getProcessedPosts(env) {
+	const processed = new Set();
+	
+	try {
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
+		if (processedData) {
+			const posts = JSON.parse(processedData);
+			posts.forEach(post => processed.add(post.uri));
+		}
+	} catch (error) {
+		console.error('Error loading processed posts:', error);
+	}
+	
+	return processed;
+}
+
+// ポストを処理済みとしてマーク
+async function markPostAsProcessed(uri, env) {
+	try {
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
+		const posts = processedData ? JSON.parse(processedData) : [];
+		
+		// 新しいポストを追加
+		posts.push({
+			uri,
+			processedAt: new Date().toISOString()
+		});
+		
+		await env.EXERCISE_TRAINER_SESSIONS.put('processed_posts', JSON.stringify(posts));
+	} catch (error) {
+		console.error('Error marking post as processed:', error);
+	}
+}
+
+// 7日以上前の処理済み記録を削除
+async function cleanupOldProcessedPosts(env) {
+	try {
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
+		if (!processedData) return;
+		
+		const posts = JSON.parse(processedData);
+		const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+		
+		// 7日以内の記録のみ残す
+		const recentPosts = posts.filter(post => 
+			new Date(post.processedAt) > sevenDaysAgo
+		);
+		
+		if (recentPosts.length !== posts.length) {
+			await env.EXERCISE_TRAINER_SESSIONS.put('processed_posts', JSON.stringify(recentPosts));
+			console.log(`Cleaned up ${posts.length - recentPosts.length} old processed post records`);
+		}
+	} catch (error) {
+		console.error('Error cleaning up processed posts:', error);
+	}
 }
