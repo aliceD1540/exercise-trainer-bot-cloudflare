@@ -25,10 +25,10 @@ npm install
 
 ```bash
 # 本番用
-npx wrangler kv:namespace create SESSIONS
+npx wrangler kv:namespace create EXERCISE_TRAINER_SESSIONS
 
 # プレビュー用
-npx wrangler kv:namespace create SESSIONS --preview
+npx wrangler kv:namespace create EXERCISE_TRAINER_SESSIONS --preview
 ```
 
 作成されたIDを`wrangler.toml`の`id`と`preview_id`に設定してください。
@@ -107,7 +107,7 @@ npx wrangler dev --test-scheduled
 KV Namespaceのセッション情報をクリア：
 
 ```bash
-npx wrangler kv:key delete bsky_session --namespace-id=YOUR_KV_ID
+npx wrangler kv:key delete bsky_session --binding=EXERCISE_TRAINER_SESSIONS
 ```
 
 ### ログ確認
