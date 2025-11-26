@@ -1,5 +1,6 @@
 import { BlueskyUtil } from './bluesky-util.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { PhotonImage, resize, SamplingFilter } from '@cf-wasm/photon';
 
 const RULES = `# Gemini 回答生成ルール
 
@@ -143,7 +144,10 @@ async function analyzeWithGemini(postData, env) {
 			try {
 				const imageResponse = await fetch(imageUrl);
 				const imageBuffer = await imageResponse.arrayBuffer();
-				const base64Image = arrayBufferToBase64(imageBuffer);
+				
+				// 画像をリサイズ（640x360以内に）
+				const resizedBuffer = await resizeImage(imageBuffer);
+				const base64Image = arrayBufferToBase64(resizedBuffer);
 				
 				parts.push({
 					inlineData: {
@@ -180,6 +184,57 @@ function arrayBufferToBase64(buffer) {
 		binary += String.fromCharCode(bytes[i]);
 	}
 	return btoa(binary);
+}
+
+// 画像をリサイズする関数（アスペクト比を維持）
+async function resizeImage(imageBuffer, maxWidth = 640, maxHeight = 360) {
+	try {
+		// バイト配列からPhotonImageを作成
+		const inputImage = PhotonImage.new_from_byteslice(new Uint8Array(imageBuffer));
+		
+		// 元の画像サイズを取得
+		const originalWidth = inputImage.get_width();
+		const originalHeight = inputImage.get_height();
+		
+		// すでに小さい場合はリサイズしない
+		if (originalWidth <= maxWidth && originalHeight <= maxHeight) {
+			console.log(`Image already small enough: ${originalWidth}x${originalHeight}`);
+			inputImage.free(); // メモリ解放
+			return imageBuffer;
+		}
+		
+		// アスペクト比を維持して新しいサイズを計算
+		const aspectRatio = originalWidth / originalHeight;
+		let newWidth, newHeight;
+		
+		if (aspectRatio > maxWidth / maxHeight) {
+			// 横長: 幅を基準にリサイズ
+			newWidth = maxWidth;
+			newHeight = Math.round(maxWidth / aspectRatio);
+		} else {
+			// 縦長: 高さを基準にリサイズ
+			newHeight = maxHeight;
+			newWidth = Math.round(maxHeight * aspectRatio);
+		}
+		
+		console.log(`Resizing image from ${originalWidth}x${originalHeight} to ${newWidth}x${newHeight}`);
+		
+		// リサイズ実行（Nearest: 高速、品質は中程度）
+		const outputImage = resize(inputImage, newWidth, newHeight, SamplingFilter.Nearest);
+		
+		// JPEG形式でエンコード（品質80）
+		const outputBytes = outputImage.get_bytes_jpeg(80);
+		
+		// メモリ解放
+		inputImage.free();
+		outputImage.free();
+		
+		return outputBytes.buffer;
+	} catch (error) {
+		console.error('Image resize failed, using original:', error);
+		// リサイズ失敗時は元の画像を返す
+		return imageBuffer;
+	}
 }
 
 // 処理済みポストのURIを取得
