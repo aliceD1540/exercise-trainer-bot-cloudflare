@@ -4,9 +4,11 @@ Blueskyのエクササイズ投稿にAIで励ましのコメントを返すボ�
 
 ## 機能
 
-- Blueskyの特定ユーザーの投稿を監視
+- Blueskyの特定ユーザーの投稿を監視（過去24時間）
+- 画像の自動リサイズ（640x360以内、アスペクト比維持）でトークン消費を削減
 - Gemini APIで投稿内容と画像を分析
 - 励ましのリプライを自動投稿
+- 重複投稿の防止（処理済み記録を7日間保持）
 - Cloudflare Workersで5分ごとに定期実行
 
 ## セットアップ
@@ -23,10 +25,10 @@ npm install
 
 ```bash
 # 本番用
-npx wrangler kv:namespace create SESSIONS
+npx wrangler kv:namespace create EXERCISE_TRAINER_SESSIONS
 
 # プレビュー用
-npx wrangler kv:namespace create SESSIONS --preview
+npx wrangler kv:namespace create EXERCISE_TRAINER_SESSIONS --preview
 ```
 
 作成されたIDを`wrangler.toml`の`id`と`preview_id`に設定してください。
@@ -75,7 +77,8 @@ npx wrangler dev --test-scheduled
 ### src/index.js
 
 - `RULES`: Geminiへのプロンプト（評価基準等）
-- 検索期間: デフォルトは12時間前まで
+- 検索期間: デフォルトは24時間前まで
+- 画像リサイズ: 最大640x360ピクセル（アスペクト比維持）
 
 ## 必要なAPI・サービス
 
@@ -89,7 +92,13 @@ npx wrangler dev --test-scheduled
 
 3. **Google Gemini API**
    - 無料枠あり
-   - gemini-2.0-flash-exp-liteを使用
+   - gemini-2.5-flashを使用
+
+## 依存関係
+
+- `@atproto/api`: Bluesky API クライアント
+- `@google/generative-ai`: Google Gemini API クライアント  
+- `@cf-wasm/photon`: 画像リサイズライブラリ（WebAssembly）
 
 ## トラブルシューティング
 
@@ -98,7 +107,7 @@ npx wrangler dev --test-scheduled
 KV Namespaceのセッション情報をクリア：
 
 ```bash
-npx wrangler kv:key delete bsky_session --namespace-id=YOUR_KV_ID
+npx wrangler kv:key delete bsky_session --binding=EXERCISE_TRAINER_SESSIONS
 ```
 
 ### ログ確認
