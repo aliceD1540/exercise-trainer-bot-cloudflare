@@ -1,9 +1,9 @@
-import { BskyAgent, RichText } from '@atproto/api';
+import { AtpAgent, RichText } from '@atproto/api';
 
 export class BlueskyUtil {
 	constructor(env) {
 		this.env = env;
-		this.agent = new BskyAgent({
+		this.agent = new AtpAgent({
 			service: 'https://bsky.social',
 		});
 	}
