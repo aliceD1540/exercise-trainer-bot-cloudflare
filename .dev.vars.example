@@ -7,3 +7,4 @@ CHECK_BSKY_DID=did:plc:xxxxxxxxxxxxxxxxxxxxx
 
 # Google Gemini API
 GOOGLE_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-2.5-flash

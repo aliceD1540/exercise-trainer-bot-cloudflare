@@ -49,6 +49,9 @@ npx wrangler secret put CHECK_BSKY_DID
 
 npx wrangler secret put GOOGLE_API_KEY
 # → Google Gemini APIキーを入力
+
+npx wrangler secret put GEMINI_MODEL
+# → 使用するGemini AIモデル名を入力（例: gemini-2.5-flash）
 ```
 
 ## デプロイ
@@ -92,7 +95,9 @@ npx wrangler dev --test-scheduled
 
 3. **Google Gemini API**
    - 無料枠あり
-   - gemini-2.5-flashを使用
+   - デフォルト: gemini-2.5-flash
+   - モデル名は環境変数 `GEMINI_MODEL` で設定可能
+   - 指定したモデルが利用できない場合、自動的にエラーメッセージを返信
 
 ## 依存関係
 

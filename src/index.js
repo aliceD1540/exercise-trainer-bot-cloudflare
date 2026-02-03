@@ -128,52 +128,67 @@ async function handleScheduled(env) {
 
 async function analyzeWithGemini(postData, env) {
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
-	const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-
-	const now = new Date();
-	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-	const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
-
-	const prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
-
-	// 画像がある場合は画像も含めて送信
-	const parts = [{ text: prompt }];
+	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
 	
-	if (postData.images && postData.images.length > 0) {
-		for (const imageUrl of postData.images) {
-			try {
-				const imageResponse = await fetch(imageUrl);
-				const imageBuffer = await imageResponse.arrayBuffer();
-				
-				// 画像をリサイズ（640x360以内に）
-				const resizedBuffer = await resizeImage(imageBuffer);
-				const base64Image = arrayBufferToBase64(resizedBuffer);
-				
-				parts.push({
-					inlineData: {
-						mimeType: 'image/jpeg',
-						data: base64Image,
-					},
-				});
-			} catch (error) {
-				console.error('Error loading image:', error);
+	try {
+		const model = genAI.getGenerativeModel({ model: modelName });
+
+		const now = new Date();
+		const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+		const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+
+		const prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
+
+		// 画像がある場合は画像も含めて送信
+		const parts = [{ text: prompt }];
+		
+		if (postData.images && postData.images.length > 0) {
+			for (const imageUrl of postData.images) {
+				try {
+					const imageResponse = await fetch(imageUrl);
+					const imageBuffer = await imageResponse.arrayBuffer();
+					
+					// 画像をリサイズ（640x360以内に）
+					const resizedBuffer = await resizeImage(imageBuffer);
+					const base64Image = arrayBufferToBase64(resizedBuffer);
+					
+					parts.push({
+						inlineData: {
+							mimeType: 'image/jpeg',
+							data: base64Image,
+						},
+					});
+				} catch (error) {
+					console.error('Error loading image:', error);
+				}
 			}
 		}
-	}
 
-	const result = await model.generateContent(parts);
-	let responseText = result.response.text();
+		const result = await model.generateContent(parts);
+		let responseText = result.response.text();
 
-	// 300文字制限
-	if (responseText.length > 300) {
-		responseText = responseText.substring(0, 300);
-		const lastPeriod = responseText.lastIndexOf('。');
-		if (lastPeriod !== -1) {
-			responseText = responseText.substring(0, lastPeriod + 1);
+		// 300文字制限
+		if (responseText.length > 300) {
+			responseText = responseText.substring(0, 300);
+			const lastPeriod = responseText.lastIndexOf('。');
+			if (lastPeriod !== -1) {
+				responseText = responseText.substring(0, lastPeriod + 1);
+			}
 		}
-	}
 
-	return responseText;
+		return responseText;
+	} catch (error) {
+		console.error('Gemini API error:', error);
+		
+		// モデルが見つからない場合のエラーチェック
+		if (error.message && (error.message.includes('models/') || error.message.includes('not found') || error.status === 404)) {
+			console.error(`AI model '${modelName}' is not available. Please update GEMINI_MODEL environment variable.`);
+			return `申し訳ございません。現在、AIモデル（${modelName}）が利用できないため、採点を実施できません。\n\nボットの設定を更新する必要があります。管理者に連絡してください。`;
+		}
+		
+		// その他のエラー
+		throw error;
+	}
 }
 
 function arrayBufferToBase64(buffer) {
