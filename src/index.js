@@ -107,7 +107,20 @@ async function handleScheduled(env) {
 				postData.images = post.embed.images.map(img => img.fullsize);
 			}
 
-			const responseText = await analyzeWithGemini(postData, env);
+			let responseText;
+			try {
+				responseText = await analyzeWithGemini(postData, env);
+			} catch (error) {
+				// AIモデルが使用できない場合の専用メッセージ
+				if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
+					const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
+					responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
+					console.error('AI model not available:', modelName);
+				} else {
+					throw error;
+				}
+			}
+			
 			await bsky.postReply(responseText, post.uri, post.cid);
 			
 			// 処理完了後、KVに記録
@@ -128,7 +141,15 @@ async function handleScheduled(env) {
 
 async function analyzeWithGemini(postData, env) {
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
-	const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
+	
+	let model;
+	try {
+		model = genAI.getGenerativeModel({ model: modelName });
+	} catch (error) {
+		console.error('Failed to get AI model:', error);
+		throw new Error('AI_MODEL_NOT_AVAILABLE');
+	}
 
 	const now = new Date();
 	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
@@ -161,19 +182,31 @@ async function analyzeWithGemini(postData, env) {
 		}
 	}
 
-	const result = await model.generateContent(parts);
-	let responseText = result.response.text();
+	try {
+		const result = await model.generateContent(parts);
+		let responseText = result.response.text();
 
-	// 300文字制限
-	if (responseText.length > 300) {
-		responseText = responseText.substring(0, 300);
-		const lastPeriod = responseText.lastIndexOf('。');
-		if (lastPeriod !== -1) {
-			responseText = responseText.substring(0, lastPeriod + 1);
+		// 300文字制限
+		if (responseText.length > 300) {
+			responseText = responseText.substring(0, 300);
+			const lastPeriod = responseText.lastIndexOf('。');
+			if (lastPeriod !== -1) {
+				responseText = responseText.substring(0, lastPeriod + 1);
+			}
 		}
-	}
 
-	return responseText;
+		return responseText;
+	} catch (error) {
+		console.error('Gemini API error:', error);
+		
+		// モデルが見つからない場合やAPIエラーの場合
+		if (error.message && (error.message.includes('model') || error.message.includes('not found'))) {
+			throw new Error('AI_MODEL_NOT_AVAILABLE');
+		}
+		
+		// その他のエラー
+		throw error;
+	}
 }
 
 function arrayBufferToBase64(buffer) {

@@ -73,12 +73,25 @@ npx wrangler dev --test-scheduled
 
 - `crons`: 実行スケジュール（デフォルト: 5分ごと）
 - `compatibility_date`: Workers互換性日付
+- `GEMINI_MODEL`: 使用するGemini AIモデル名（デフォルト: gemini-2.5-flash）
+  - モデルが廃止された場合は、この設定を更新してください
 
 ### src/index.js
 
 - `RULES`: Geminiへのプロンプト（評価基準等）
 - 検索期間: デフォルトは24時間前まで
 - 画像リサイズ: 最大640x360ピクセル（アスペクト比維持）
+
+### AIモデルの更新方法
+
+使用しているAIモデルが廃止された場合、`wrangler.toml`の`GEMINI_MODEL`を更新してください：
+
+```toml
+[vars]
+GEMINI_MODEL = "gemini-2.5-flash-latest"  # 新しいモデル名に変更
+```
+
+モデルが利用できない場合、ボットは自動的にエラーメッセージをリプライします。
 
 ## 必要なAPI・サービス
 
