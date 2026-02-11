@@ -424,19 +424,21 @@ async function checkAndSendReminder(env, bsky) {
 		const hoursSinceEvaluation = (now - lastEvaluationTime) / (1000 * 60 * 60);
 		console.log(`Hours since last evaluation: ${hoursSinceEvaluation.toFixed(2)}`);
 		
-		// 72時間（3日）経過していない場合は何もしない
-		if (hoursSinceEvaluation < 72) {
-			console.log('Less than 72 hours since last evaluation, no reminder needed');
+		const initialHours = parseFloat(env.REMINDER_INITIAL_HOURS) || 72;
+		// 初回リマインダーの時間経過していない場合は何もしない
+		if (hoursSinceEvaluation < initialHours) {
+			console.log(`Less than ${initialHours} hours since last evaluation, no reminder needed`);
 			return;
 		}
 		
-		// リマインダーを送信済みの場合、24時間経過しているかチェック
+		// リマインダーを送信済みの場合、指定時間経過しているかチェック
 		if (lastReminderTime) {
 			const hoursSinceReminder = (now - lastReminderTime) / (1000 * 60 * 60);
 			console.log(`Hours since last reminder: ${hoursSinceReminder.toFixed(2)}`);
 			
-			if (hoursSinceReminder < 24) {
-				console.log('Less than 24 hours since last reminder, skipping');
+			const intervalHours = parseFloat(env.REMINDER_INTERVAL_HOURS) || 24;
+			if (hoursSinceReminder < intervalHours) {
+				console.log(`Less than ${intervalHours} hours since last reminder, skipping`);
 				return;
 			}
 		}

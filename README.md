@@ -79,6 +79,8 @@ npx wrangler dev --test-scheduled
 - `compatibility_date`: Workers互換性日付
 - `GEMINI_MODEL`: 使用するGemini AIモデル名（デフォルト: gemini-2.5-flash）
   - モデルが廃止された場合は、この設定を更新してください
+- `REMINDER_INITIAL_HOURS`: 初回リマインダー送信までの時間（デフォルト: 72時間）
+- `REMINDER_INTERVAL_HOURS`: リマインダーの再送間隔（デフォルト: 24時間）
 
 ### src/index.js
 
