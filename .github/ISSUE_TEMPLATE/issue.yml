@@ -1,0 +1,32 @@
+name: Issue
+description: バグ報告、機能提案、質問など
+labels: []
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概要
+      description: 何についてのissueか簡潔に説明してください
+      placeholder: 例：リマインダーの送信タイミングを変更したい
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 問題
+      description: 現状の問題点や背景を説明してください
+      placeholder: |
+        例：
+        - 現在は72時間固定だが、ユーザーによって運動頻度が異なる
+        - 週末は運動しない人もいるため、柔軟に設定したい
+
+  - type: textarea
+    id: approach
+    attributes:
+      label: 実装方針
+      description: どのように実装・解決すべきか案があれば記載してください
+      placeholder: |
+        例：
+        - wrangler.tomlに環境変数を追加
+        - REMINDER_INITIAL_HOURSとREMINDER_INTERVAL_HOURSで設定可能にする

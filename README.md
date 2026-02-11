@@ -9,6 +9,10 @@ Blueskyのエクササイズ投稿にAIで励ましのコメントを返すボ�
 - Gemini APIで投稿内容と画像を分析
 - 励ましのリプライを自動投稿
 - 重複投稿の防止（処理済み記録を7日間保持）
+- **3日以上運動していない場合、リマインダーメッセージを送信**
+  - 最後の評価から72時間以上経過したら初回メッセージ
+  - その後24時間ごとに追加のリマインダー
+  - 体調を気遣う優しいトーンで問いかけ
 - Cloudflare Workersで5分ごとに定期実行
 
 ## セットアップ
@@ -75,6 +79,8 @@ npx wrangler dev --test-scheduled
 - `compatibility_date`: Workers互換性日付
 - `GEMINI_MODEL`: 使用するGemini AIモデル名（デフォルト: gemini-2.5-flash）
   - モデルが廃止された場合は、この設定を更新してください
+- `REMINDER_INITIAL_HOURS`: 初回リマインダー送信までの時間（デフォルト: 72時間）
+- `REMINDER_INTERVAL_HOURS`: リマインダーの再送間隔（デフォルト: 24時間）
 
 ### src/index.js
 

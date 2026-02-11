@@ -41,6 +41,27 @@ const RULES = `# Gemini 回答生成ルール
 -   過剰なトレーニングなど誤った箇所があれば指摘してください。
 `;
 
+const REMINDER_RULES = `# リマインダーメッセージ生成ルール
+
+あなたはプロのフィットネストレーナーであり、しばらく運動していないユーザーに声をかけるボットです。
+**最重要ルール：生成するテキストは、絶対に300文字以内に収めてください。**
+
+## メッセージの方針
+
+-   最近運動していない人に対する問いかけです
+-   あくまで「サボってないか？」ではなく「体調は大丈夫か？」と心配するニュアンスで問いかけてください
+-   体調不良以外にも旅行や疲れ、趣味に没頭しすぎたなどがありえます
+-   無理をせず、自分のペースで大丈夫だということを伝えてください
+-   前向きで優しいトーンを維持してください
+
+## スタイル
+
+-   ハッシュタグ（#）は絶対に含めないでください。
+-   専門用語を避け、誰にでも分かりやすい言葉で説明してください。
+-   「現在の日時」は現地時間で24時間表記です。
+-   「現在の日時」を内容に含める必要はありません。
+`;
+
 export default {
 	async scheduled(event, env, ctx) {
 		try {
@@ -77,6 +98,8 @@ async function handleScheduled(env) {
 	// APIレスポンスの構造を修正: posts.data.posts
 	if (!posts || !posts.data || !posts.data.posts || !Array.isArray(posts.data.posts)) {
 		console.log('No posts found or invalid response structure');
+		// 投稿がない場合でもリマインダーチェックを実行
+		await checkAndSendReminder(env, bsky);
 		return;
 	}
 
@@ -87,6 +110,8 @@ async function handleScheduled(env) {
 	console.log('Previously processed posts:', processedPosts.size);
 
 	let newPostsCount = 0;
+	let latestPostTime = null;
+	
 	for (const post of posts.data.posts) {
 		// 既に処理済みのポストはスキップ
 		if (processedPosts.has(post.uri)) {
@@ -127,6 +152,12 @@ async function handleScheduled(env) {
 			await markPostAsProcessed(post.uri, env);
 			newPostsCount++;
 			
+			// 最新の投稿時刻を記録
+			const postTime = new Date(postData.created_at);
+			if (!latestPostTime || postTime > latestPostTime) {
+				latestPostTime = postTime;
+			}
+			
 			console.log('Replied to post:', post.uri);
 		} catch (error) {
 			console.error('Error processing post:', error);
@@ -135,8 +166,16 @@ async function handleScheduled(env) {
 	
 	console.log('Processed new posts:', newPostsCount);
 	
+	// 新しい投稿を処理した場合、最終評価時刻を更新
+	if (latestPostTime) {
+		await updateLastEvaluationTime(latestPostTime.toISOString(), env);
+	}
+	
 	// 古い処理済み記録をクリーンアップ（7日以上前の記録を削除）
 	await cleanupOldProcessedPosts(env);
+	
+	// リマインダーのチェックと送信
+	await checkAndSendReminder(env, bsky);
 }
 
 async function analyzeWithGemini(postData, env) {
@@ -324,5 +363,145 @@ async function cleanupOldProcessedPosts(env) {
 		}
 	} catch (error) {
 		console.error('Error cleaning up processed posts:', error);
+	}
+}
+
+// 最終評価時刻を更新
+async function updateLastEvaluationTime(time, env) {
+	try {
+		await env.EXERCISE_TRAINER_SESSIONS.put('last_evaluation_time', time);
+		console.log('Updated last evaluation time:', time);
+	} catch (error) {
+		console.error('Error updating last evaluation time:', error);
+	}
+}
+
+// 最終評価時刻を取得
+async function getLastEvaluationTime(env) {
+	try {
+		const time = await env.EXERCISE_TRAINER_SESSIONS.get('last_evaluation_time');
+		return time ? new Date(time) : null;
+	} catch (error) {
+		console.error('Error getting last evaluation time:', error);
+		return null;
+	}
+}
+
+// 最終リマインダー送信時刻を更新
+async function updateLastReminderTime(time, env) {
+	try {
+		await env.EXERCISE_TRAINER_SESSIONS.put('last_reminder_time', time);
+		console.log('Updated last reminder time:', time);
+	} catch (error) {
+		console.error('Error updating last reminder time:', error);
+	}
+}
+
+// 最終リマインダー送信時刻を取得
+async function getLastReminderTime(env) {
+	try {
+		const time = await env.EXERCISE_TRAINER_SESSIONS.get('last_reminder_time');
+		return time ? new Date(time) : null;
+	} catch (error) {
+		console.error('Error getting last reminder time:', error);
+		return null;
+	}
+}
+
+// リマインダーが必要かチェックして送信
+async function checkAndSendReminder(env, bsky) {
+	try {
+		const now = new Date();
+		const lastEvaluationTime = await getLastEvaluationTime(env);
+		const lastReminderTime = await getLastReminderTime(env);
+		
+		// 最終評価時刻がない場合は何もしない（初回実行時など）
+		if (!lastEvaluationTime) {
+			console.log('No last evaluation time found, skipping reminder check');
+			return;
+		}
+		
+		const hoursSinceEvaluation = (now - lastEvaluationTime) / (1000 * 60 * 60);
+		console.log(`Hours since last evaluation: ${hoursSinceEvaluation.toFixed(2)}`);
+		
+		const initialHours = parseFloat(env.REMINDER_INITIAL_HOURS) || 72;
+		// 初回リマインダーの時間経過していない場合は何もしない
+		if (hoursSinceEvaluation < initialHours) {
+			console.log(`Less than ${initialHours} hours since last evaluation, no reminder needed`);
+			return;
+		}
+		
+		// リマインダーを送信済みの場合、指定時間経過しているかチェック
+		if (lastReminderTime) {
+			const hoursSinceReminder = (now - lastReminderTime) / (1000 * 60 * 60);
+			console.log(`Hours since last reminder: ${hoursSinceReminder.toFixed(2)}`);
+			
+			const intervalHours = parseFloat(env.REMINDER_INTERVAL_HOURS) || 24;
+			if (hoursSinceReminder < intervalHours) {
+				console.log(`Less than ${intervalHours} hours since last reminder, skipping`);
+				return;
+			}
+		}
+		
+		// リマインダーメッセージを生成して送信
+		console.log('Sending reminder message...');
+		const reminderText = await generateReminderMessage(env, hoursSinceEvaluation);
+		
+		// ユーザーの最新投稿を取得してリプライとして送信
+		// （リプライ先がない場合は通常投稿として送信）
+		const profile = await bsky.getProfile(env.CHECK_BSKY_DID);
+		const handle = profile.data.handle;
+		
+		// @ハンドルをつけて投稿
+		const messageWithMention = `@${handle} ${reminderText}`;
+		await bsky.postText(messageWithMention);
+		
+		// 最終リマインダー送信時刻を更新
+		await updateLastReminderTime(now.toISOString(), env);
+		console.log('Reminder sent successfully');
+	} catch (error) {
+		console.error('Error checking and sending reminder:', error);
+	}
+}
+
+// リマインダーメッセージを生成
+async function generateReminderMessage(env, hoursSinceEvaluation) {
+	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
+	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
+	
+	let model;
+	try {
+		model = genAI.getGenerativeModel({ model: modelName });
+	} catch (error) {
+		console.error('Failed to get AI model:', error);
+		// フォールバック: シンプルなメッセージを返す
+		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
+	}
+
+	const now = new Date();
+	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+	const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+	const daysSince = Math.floor(hoursSinceEvaluation / 24);
+
+	const prompt = `${REMINDER_RULES}\n\n最後の運動から約${daysSince}日が経過しています。\n現在の日時: ${formattedTime}\n\n体調を気遣いながら、無理のない範囲で声をかけるメッセージを生成してください。`;
+
+	try {
+		const result = await model.generateContent(prompt);
+		let responseText = result.response.text();
+
+		// 300文字制限
+		if (responseText.length > 300) {
+			responseText = responseText.substring(0, 300);
+			const lastPeriod = responseText.lastIndexOf('。');
+			if (lastPeriod !== -1) {
+				responseText = responseText.substring(0, lastPeriod + 1);
+			}
+		}
+
+		return responseText;
+	} catch (error) {
+		console.error('Gemini API error for reminder:', error);
+		// フォールバック: シンプルなメッセージを返す
+		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
 	}
 }
