@@ -2,6 +2,35 @@ import { BlueskyUtil } from './bluesky-util.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { PhotonImage, resize, SamplingFilter } from '@cf-wasm/photon';
 
+/**
+ * 日本時間（JST）のDateオブジェクトを取得
+ * @returns {Date} 日本時間のDateオブジェクト
+ */
+function getJSTDate() {
+	const now = new Date();
+	// 日本時間に変換（UTC+9時間）
+	return new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+}
+
+/**
+ * 日本時間の時間帯を判定
+ * @param {Date} jstDate 日本時間のDateオブジェクト
+ * @returns {string} 時間帯（'朝', '昼', '夜'）
+ */
+function getTimeOfDay(jstDate) {
+	const hour = jstDate.getHours();
+	// 6～11時：朝
+	if (hour >= 6 && hour < 11) {
+		return '朝';
+	}
+	// 11～18時：昼
+	if (hour >= 11 && hour < 18) {
+		return '昼';
+	}
+	// 18～翌6時：夜
+	return '夜';
+}
+
 const RULES = `# Gemini 回答生成ルール
 
 あなたはプロのフィットネストレーナーであり、Blueskyに投稿するボットです。
@@ -29,10 +58,14 @@ const RULES = `# Gemini 回答生成ルール
 -   常にポジティブで、モチベーションを高めるトーンを維持してください。
 -   ハッシュタグ（#）は絶対に含めないでください。
 -   専門用語を避け、誰にでも分かりやすい言葉で説明してください。
--   「現在の日時」は現地時間で24時間表記です。
--   「現在の日時」が朝の時間帯の投稿であれば、その日の活力を引き出すような内容にしてください。
--   「現在の日時」が昼の時間帯の投稿であれば、午後の活力を引き出すような内容にしてください。
--   「現在の日時」が夜の時間帯の投稿であれば、一日の疲れを労うような内容にしてください。
+-   「現在の日時」は日本時間（JST）で24時間表記です。
+-   「時間帯」は以下のように判定されます：
+    -   朝：6時～11時
+    -   昼：11時～18時
+    -   夜：18時～翌6時
+-   「時間帯」が朝の場合、その日の活力を引き出すような内容にしてください。
+-   「時間帯」が昼の場合、午後の活力を引き出すような内容にしてください。
+-   「時間帯」が夜の場合、一日の疲れを労うような内容にしてください。
 -   「現在の日時」を内容に含める必要はありません。
 -   文面から当日2回目以降のエクササイズだと読み取れる場合、評価を高めにしてください。
 -   画像内のスコアは中途半端でも最高得点であることがあります。改善点には含めないようにしてください。
@@ -58,7 +91,12 @@ const REMINDER_RULES = `# リマインダーメッセージ生成ルール
 
 -   ハッシュタグ（#）は絶対に含めないでください。
 -   専門用語を避け、誰にでも分かりやすい言葉で説明してください。
--   「現在の日時」は現地時間で24時間表記です。
+-   「現在の日時」は日本時間（JST）で24時間表記です。
+-   「時間帯」は以下のように判定されます：
+    -   朝：6時～11時
+    -   昼：11時～18時
+    -   夜：18時～翌6時
+-   「時間帯」に応じて適切なトーンでメッセージを作成してください。
 -   「現在の日時」を内容に含める必要はありません。
 `;
 
@@ -190,11 +228,13 @@ async function analyzeWithGemini(postData, env) {
 		throw new Error('AI_MODEL_NOT_AVAILABLE');
 	}
 
-	const now = new Date();
-	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-	const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+	// 日本時間を取得して時間帯を判定
+	const jstDate = getJSTDate();
+	const timeOfDay = getTimeOfDay(jstDate);
+	const formattedTime = jstDate.toLocaleString('ja-JP', { hour12: false });
 
-	const prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
+	const prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n時間帯: ${timeOfDay}\n\n`;
+
 
 	// 画像がある場合は画像も含めて送信
 	const parts = [{ text: prompt }];
@@ -478,12 +518,13 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
 	}
 
-	const now = new Date();
-	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-	const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+	// 日本時間を取得して時間帯を判定
+	const jstDate = getJSTDate();
+	const timeOfDay = getTimeOfDay(jstDate);
+	const formattedTime = jstDate.toLocaleString('ja-JP', { hour12: false });
 	const daysSince = Math.floor(hoursSinceEvaluation / 24);
 
-	const prompt = `${REMINDER_RULES}\n\n最後の運動から約${daysSince}日が経過しています。\n現在の日時: ${formattedTime}\n\n体調を気遣いながら、無理のない範囲で声をかけるメッセージを生成してください。`;
+	const prompt = `${REMINDER_RULES}\n\n最後の運動から約${daysSince}日が経過しています。\n現在の日時: ${formattedTime}\n時間帯: ${timeOfDay}\n\n体調を気遣いながら、無理のない範囲で声をかけるメッセージを生成してください。`;
 
 	try {
 		const result = await model.generateContent(prompt);
