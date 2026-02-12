@@ -576,7 +576,24 @@ async function handleNotifications(env, bsky) {
 					}
 				}
 				
-				await bsky.postReply(responseText, notification.uri, notification.cid);
+				// スレッド情報を取得してroot参照を正しく設定
+				let rootUri = null;
+				let rootCid = null;
+				
+				const threadInfo = await bsky.getPostThread(notification.uri);
+				if (threadInfo && threadInfo.data && threadInfo.data.thread) {
+					const thread = threadInfo.data.thread;
+					
+					// スレッドのrootを取得
+					if (thread.post && thread.post.record && thread.post.record.reply) {
+						// この投稿自体がリプライの場合、rootを使用
+						rootUri = thread.post.record.reply.root.uri;
+						rootCid = thread.post.record.reply.root.cid;
+					}
+					// rootが取得できない場合は、この投稿自体がrootとなる
+				}
+				
+				await bsky.postReply(responseText, notification.uri, notification.cid, rootUri, rootCid);
 				
 				// 処理完了後、KVに記録
 				await markNotificationAsProcessed(notification.uri, env);
