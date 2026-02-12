@@ -183,7 +183,7 @@ async function handleScheduled(env) {
 	await checkAndSendReminder(env, bsky);
 }
 
-async function analyzeWithGemini(postData, env) {
+async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
 	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
 	
@@ -199,7 +199,20 @@ async function analyzeWithGemini(postData, env) {
 	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
 	const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
 
-	const prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
+	// 会話の続きの場合は簡単な返答用プロンプト
+	let prompt;
+	if (isSimpleReply) {
+		prompt = `あなたはフレンドリーなフィットネストレーナーです。ユーザーの返信に対して、30文字程度の自然で簡潔な返答をしてください。
+
+# ユーザーのメッセージ:
+${postData.text}
+
+現在の日時: ${formattedTime}
+
+※ルールに従った評価は不要です。会話を続けようとせず、感謝や応援の気持ちを伝える簡潔な返答をしてください。`;
+	} else {
+		prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
+	}
 
 	// 画像がある場合は画像も含めて送信
 	const parts = [{ text: prompt }];
@@ -230,9 +243,10 @@ async function analyzeWithGemini(postData, env) {
 		const result = await model.generateContent(parts);
 		let responseText = result.response.text();
 
-		// 300文字制限
-		if (responseText.length > 300) {
-			responseText = responseText.substring(0, 300);
+		// 簡単な返答の場合は50文字、通常は300文字制限
+		const maxLength = isSimpleReply ? 50 : 300;
+		if (responseText.length > maxLength) {
+			responseText = responseText.substring(0, maxLength);
 			const lastPeriod = responseText.lastIndexOf('。');
 			if (lastPeriod !== -1) {
 				responseText = responseText.substring(0, lastPeriod + 1);
@@ -580,44 +594,36 @@ async function handleNotifications(env, bsky) {
 				
 				let responseText;
 				
-				// ボットへのリプライ（会話の続き）なら簡単な返答
-				if (isReplyToBot) {
-					const simpleResponses = [
-						'ありがとうございます！',
-						'頑張ってください！',
-						'応援しています！',
-						'素晴らしいですね！',
-						'その調子です！',
-						'無理せず続けてくださいね。',
-						'いつでも相談してください！',
-					];
-					responseText = simpleResponses[Math.floor(Math.random() * simpleResponses.length)];
-					console.log('Simple reply to conversation:', notification.uri);
-				} else {
-					// 初回のメンションなら通常の評価
-					const postData = {
-						text: notification.record.text,
-						created_at: notification.record.createdAt,
-						author: notification.author.did,
-						uri: notification.uri,
-					};
-					
-					// 画像URLを取得
-					if (notification.record.embed?.images) {
-						postData.images = notification.record.embed.images.map(img => img.fullsize);
+				// 投稿データを準備
+				const postData = {
+					text: notification.record.text,
+					created_at: notification.record.createdAt,
+					author: notification.author.did,
+					uri: notification.uri,
+				};
+				
+				// 画像URLを取得
+				if (notification.record.embed?.images) {
+					postData.images = notification.record.embed.images.map(img => img.fullsize);
+				}
+				
+				try {
+					// ボットへのリプライ（会話の続き）なら簡単な返答を生成
+					if (isReplyToBot) {
+						responseText = await analyzeWithGemini(postData, env, true);
+						console.log('Simple reply to conversation:', notification.uri);
+					} else {
+						// 初回のメンションなら通常の評価
+						responseText = await analyzeWithGemini(postData, env, false);
 					}
-					
-					try {
-						responseText = await analyzeWithGemini(postData, env);
-					} catch (error) {
-						// AIモデルが使用できない場合の専用メッセージ
-						if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
-							const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
-							responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
-							console.error('AI model not available:', modelName);
-						} else {
-							throw error;
-						}
+				} catch (error) {
+					// AIモデルが使用できない場合の専用メッセージ
+					if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
+						const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
+						responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
+						console.error('AI model not available:', modelName);
+					} else {
+						throw error;
 					}
 				}
 				
