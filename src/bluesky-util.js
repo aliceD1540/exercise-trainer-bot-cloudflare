@@ -59,7 +59,7 @@ export class BlueskyUtil {
 		});
 	}
 
-	async postReply(text, replyToUri, replyToCid) {
+	async postReply(text, replyToUri, replyToCid, rootUri = null, rootCid = null) {
 		const rt = new RichText({ text });
 		await rt.detectFacets(this.agent);
 
@@ -68,11 +68,17 @@ export class BlueskyUtil {
 			cid: replyToCid,
 		};
 
+		// rootが指定されていない場合は、parentと同じとする（最上位投稿へのリプライ）
+		const rootRef = (rootUri && rootCid) ? {
+			uri: rootUri,
+			cid: rootCid,
+		} : parentRef;
+
 		return await this.agent.post({
 			text: rt.text,
 			facets: rt.facets,
 			reply: {
-				root: parentRef,
+				root: rootRef,
 				parent: parentRef,
 			},
 		});
@@ -98,5 +104,41 @@ export class BlueskyUtil {
 
 	async getProfile(did) {
 		return await this.agent.getProfile({ actor: did });
+	}
+
+	// 通知（メンション/リプライ）を取得
+	async getNotifications({ limit = 50, seenAt = null }) {
+		try {
+			const params = { limit };
+			if (seenAt) {
+				params.seenAt = seenAt;
+			}
+			
+			const result = await this.agent.listNotifications(params);
+			return result;
+		} catch (error) {
+			console.error('Get notifications error:', error);
+			return { data: { notifications: [] } };
+		}
+	}
+
+	// 通知を既読にする
+	async updateSeenNotifications() {
+		try {
+			await this.agent.updateSeenNotifications();
+		} catch (error) {
+			console.error('Update seen notifications error:', error);
+		}
+	}
+
+	// 投稿のスレッド情報を取得
+	async getPostThread(uri) {
+		try {
+			const result = await this.agent.getPostThread({ uri, depth: 0 });
+			return result;
+		} catch (error) {
+			console.error('Get post thread error:', error);
+			return null;
+		}
 	}
 }
