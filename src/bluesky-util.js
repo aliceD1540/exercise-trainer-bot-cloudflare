@@ -99,4 +99,29 @@ export class BlueskyUtil {
 	async getProfile(did) {
 		return await this.agent.getProfile({ actor: did });
 	}
+
+	// 通知（メンション/リプライ）を取得
+	async getNotifications({ limit = 50, seenAt = null }) {
+		try {
+			const params = { limit };
+			if (seenAt) {
+				params.seenAt = seenAt;
+			}
+			
+			const result = await this.agent.listNotifications(params);
+			return result;
+		} catch (error) {
+			console.error('Get notifications error:', error);
+			return { data: { notifications: [] } };
+		}
+	}
+
+	// 通知を既読にする
+	async updateSeenNotifications() {
+		try {
+			await this.agent.updateSeenNotifications();
+		} catch (error) {
+			console.error('Update seen notifications error:', error);
+		}
+	}
 }
