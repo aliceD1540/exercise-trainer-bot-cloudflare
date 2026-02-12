@@ -550,35 +550,10 @@ async function handleNotifications(env, bsky) {
 			}
 			
 			try {
-				const postData = {
-					text: notification.record.text,
-					created_at: notification.record.createdAt,
-					author: notification.author.did,
-					uri: notification.uri,
-				};
-				
-				// 画像URLを取得
-				if (notification.record.embed?.images) {
-					postData.images = notification.record.embed.images.map(img => img.fullsize);
-				}
-				
-				let responseText;
-				try {
-					responseText = await analyzeWithGemini(postData, env);
-				} catch (error) {
-					// AIモデルが使用できない場合の専用メッセージ
-					if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
-						const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
-						responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
-						console.error('AI model not available:', modelName);
-					} else {
-						throw error;
-					}
-				}
-				
-				// スレッド情報を取得してroot参照を正しく設定
+				// スレッド情報を取得してroot参照を正しく設定し、会話の文脈を判断
 				let rootUri = null;
 				let rootCid = null;
+				let isReplyToBot = false;
 				
 				const threadInfo = await bsky.getPostThread(notification.uri);
 				if (threadInfo && threadInfo.data && threadInfo.data.thread) {
@@ -589,8 +564,61 @@ async function handleNotifications(env, bsky) {
 						// この投稿自体がリプライの場合、rootを使用
 						rootUri = thread.post.record.reply.root.uri;
 						rootCid = thread.post.record.reply.root.cid;
+						
+						// リプライ先（parent）の投稿者を確認
+						if (thread.parent && thread.parent.post && thread.parent.post.author) {
+							const parentAuthorDid = thread.parent.post.author.did;
+							const botDid = bsky.agent.session?.did;
+							
+							// リプライ先がボット自身の投稿なら会話の続き
+							if (botDid && parentAuthorDid === botDid) {
+								isReplyToBot = true;
+							}
+						}
 					}
-					// rootが取得できない場合は、この投稿自体がrootとなる
+				}
+				
+				let responseText;
+				
+				// ボットへのリプライ（会話の続き）なら簡単な返答
+				if (isReplyToBot) {
+					const simpleResponses = [
+						'ありがとうございます！',
+						'頑張ってください！',
+						'応援しています！',
+						'素晴らしいですね！',
+						'その調子です！',
+						'無理せず続けてくださいね。',
+						'いつでも相談してください！',
+					];
+					responseText = simpleResponses[Math.floor(Math.random() * simpleResponses.length)];
+					console.log('Simple reply to conversation:', notification.uri);
+				} else {
+					// 初回のメンションなら通常の評価
+					const postData = {
+						text: notification.record.text,
+						created_at: notification.record.createdAt,
+						author: notification.author.did,
+						uri: notification.uri,
+					};
+					
+					// 画像URLを取得
+					if (notification.record.embed?.images) {
+						postData.images = notification.record.embed.images.map(img => img.fullsize);
+					}
+					
+					try {
+						responseText = await analyzeWithGemini(postData, env);
+					} catch (error) {
+						// AIモデルが使用できない場合の専用メッセージ
+						if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
+							const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
+							responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
+							console.error('AI model not available:', modelName);
+						} else {
+							throw error;
+						}
+					}
 				}
 				
 				await bsky.postReply(responseText, notification.uri, notification.cid, rootUri, rootCid);
