@@ -112,6 +112,8 @@ async function handleScheduled(env) {
 	let newPostsCount = 0;
 	let latestPostTime = null;
 	
+	// ハッシュタグ付き投稿の処理
+	
 	for (const post of posts.data.posts) {
 		// 既に処理済みのポストはスキップ
 		if (processedPosts.has(post.uri)) {
@@ -174,11 +176,14 @@ async function handleScheduled(env) {
 	// 古い処理済み記録をクリーンアップ（7日以上前の記録を削除）
 	await cleanupOldProcessedPosts(env);
 	
+	// Botへの通知（メンション/リプライ）を処理
+	await handleNotifications(env, bsky);
+	
 	// リマインダーのチェックと送信
 	await checkAndSendReminder(env, bsky);
 }
 
-async function analyzeWithGemini(postData, env) {
+async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
 	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
 	
@@ -194,7 +199,20 @@ async function analyzeWithGemini(postData, env) {
 	const jstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
 	const formattedTime = jstTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
 
-	const prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
+	// 会話の続きの場合は簡単な返答用プロンプト
+	let prompt;
+	if (isSimpleReply) {
+		prompt = `あなたはフレンドリーなフィットネストレーナーです。ユーザーの返信に対して、30文字程度の自然で簡潔な返答をしてください。
+
+# ユーザーのメッセージ:
+${postData.text}
+
+現在の日時: ${formattedTime}
+
+※ルールに従った評価は不要です。会話を続けようとせず、感謝や応援の気持ちを伝える簡潔な返答をしてください。`;
+	} else {
+		prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n\n`;
+	}
 
 	// 画像がある場合は画像も含めて送信
 	const parts = [{ text: prompt }];
@@ -225,9 +243,10 @@ async function analyzeWithGemini(postData, env) {
 		const result = await model.generateContent(parts);
 		let responseText = result.response.text();
 
-		// 300文字制限
-		if (responseText.length > 300) {
-			responseText = responseText.substring(0, 300);
+		// 簡単な返答の場合は50文字、通常は300文字制限
+		const maxLength = isSimpleReply ? 50 : 300;
+		if (responseText.length > maxLength) {
+			responseText = responseText.substring(0, maxLength);
 			const lastPeriod = responseText.lastIndexOf('。');
 			if (lastPeriod !== -1) {
 				responseText = responseText.substring(0, lastPeriod + 1);
@@ -503,5 +522,185 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 		console.error('Gemini API error for reminder:', error);
 		// フォールバック: シンプルなメッセージを返す
 		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
+	}
+}
+
+// Botへの通知（メンション/リプライ）を処理
+async function handleNotifications(env, bsky) {
+	try {
+		console.log('Checking notifications...');
+		
+		// 通知を取得
+		const notifications = await bsky.getNotifications({ limit: 50 });
+		
+		if (!notifications || !notifications.data || !notifications.data.notifications || !Array.isArray(notifications.data.notifications)) {
+			console.log('No notifications found or invalid response structure');
+			return;
+		}
+		
+		console.log('Found notifications:', notifications.data.notifications.length);
+		
+		// 処理済み通知のURIを取得
+		const processedNotifications = await getProcessedNotifications(env);
+		console.log('Previously processed notifications:', processedNotifications.size);
+		
+		let newNotificationsCount = 0;
+		
+		for (const notification of notifications.data.notifications) {
+			// mention または reply のみ処理
+			if (notification.reason !== 'mention' && notification.reason !== 'reply') {
+				continue;
+			}
+			
+			// CHECK_BSKY_DIDからの通知のみ処理
+			if (notification.author.did !== env.CHECK_BSKY_DID) {
+				continue;
+			}
+			
+			// 既に処理済みの通知はスキップ
+			if (processedNotifications.has(notification.uri)) {
+				console.log('Skipping already processed notification:', notification.uri);
+				continue;
+			}
+			
+			try {
+				// スレッド情報を取得してroot参照を正しく設定し、会話の文脈を判断
+				let rootUri = null;
+				let rootCid = null;
+				let isReplyToBot = false;
+				
+				const threadInfo = await bsky.getPostThread(notification.uri);
+				if (threadInfo && threadInfo.data && threadInfo.data.thread) {
+					const thread = threadInfo.data.thread;
+					
+					// スレッドのrootを取得
+					if (thread.post && thread.post.record && thread.post.record.reply) {
+						// この投稿自体がリプライの場合、rootを使用
+						rootUri = thread.post.record.reply.root.uri;
+						rootCid = thread.post.record.reply.root.cid;
+						
+						// リプライ先（parent）の投稿者を確認
+						if (thread.parent && thread.parent.post && thread.parent.post.author) {
+							const parentAuthorDid = thread.parent.post.author.did;
+							const botDid = bsky.agent.session?.did;
+							
+							// リプライ先がボット自身の投稿なら会話の続き
+							if (botDid && parentAuthorDid === botDid) {
+								isReplyToBot = true;
+							}
+						}
+					}
+				}
+				
+				let responseText;
+				
+				// 投稿データを準備
+				const postData = {
+					text: notification.record.text,
+					created_at: notification.record.createdAt,
+					author: notification.author.did,
+					uri: notification.uri,
+				};
+				
+				// 画像URLを取得
+				if (notification.record.embed?.images) {
+					postData.images = notification.record.embed.images.map(img => img.fullsize);
+				}
+				
+				try {
+					// ボットへのリプライ（会話の続き）なら簡単な返答を生成
+					if (isReplyToBot) {
+						responseText = await analyzeWithGemini(postData, env, true);
+						console.log('Simple reply to conversation:', notification.uri);
+					} else {
+						// 初回のメンションなら通常の評価
+						responseText = await analyzeWithGemini(postData, env, false);
+					}
+				} catch (error) {
+					// AIモデルが使用できない場合の専用メッセージ
+					if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
+						const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
+						responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
+						console.error('AI model not available:', modelName);
+					} else {
+						throw error;
+					}
+				}
+				
+				await bsky.postReply(responseText, notification.uri, notification.cid, rootUri, rootCid);
+				
+				// 処理完了後、KVに記録
+				await markNotificationAsProcessed(notification.uri, env);
+				newNotificationsCount++;
+				
+				console.log('Replied to notification:', notification.uri);
+			} catch (error) {
+				console.error('Error processing notification:', error);
+			}
+		}
+		
+		console.log('Processed new notifications:', newNotificationsCount);
+		
+		// 処理済み通知の記録をクリーンアップ（7日以上前の記録を削除）
+		await cleanupOldProcessedNotifications(env);
+	} catch (error) {
+		console.error('Error handling notifications:', error);
+	}
+}
+
+// 処理済み通知のURIを取得
+async function getProcessedNotifications(env) {
+	const processed = new Set();
+	
+	try {
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
+		if (processedData) {
+			const notifications = JSON.parse(processedData);
+			notifications.forEach(notification => processed.add(notification.uri));
+		}
+	} catch (error) {
+		console.error('Error loading processed notifications:', error);
+	}
+	
+	return processed;
+}
+
+// 通知を処理済みとしてマーク
+async function markNotificationAsProcessed(uri, env) {
+	try {
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
+		const notifications = processedData ? JSON.parse(processedData) : [];
+		
+		// 新しい通知を追加
+		notifications.push({
+			uri,
+			processedAt: new Date().toISOString()
+		});
+		
+		await env.EXERCISE_TRAINER_SESSIONS.put('processed_notifications', JSON.stringify(notifications));
+	} catch (error) {
+		console.error('Error marking notification as processed:', error);
+	}
+}
+
+// 7日以上前の処理済み通知記録を削除
+async function cleanupOldProcessedNotifications(env) {
+	try {
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
+		if (!processedData) return;
+		
+		const notifications = JSON.parse(processedData);
+		const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+		
+		// 7日以内の記録のみ残す
+		const recentNotifications = notifications.filter(notification => 
+			new Date(notification.processedAt) > sevenDaysAgo
+		);
+		
+		if (recentNotifications.length !== notifications.length) {
+			await env.EXERCISE_TRAINER_SESSIONS.put('processed_notifications', JSON.stringify(recentNotifications));
+		}
+	} catch (error) {
+		console.error('Error cleaning up processed notifications:', error);
 	}
 }
