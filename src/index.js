@@ -290,14 +290,23 @@ ${postData.text}
 	const parts = [{ text: prompt }];
 	
 	if (postData.images && postData.images.length > 0) {
-		for (const imageUrl of postData.images) {
-			try {
-				const imageResponse = await fetch(imageUrl);
-				const imageBuffer = await imageResponse.arrayBuffer();
-				
-				// 画像をリサイズ（640x360以内に）
-				const resizedBuffer = await resizeImage(imageBuffer);
-				const base64Image = arrayBufferToBase64(resizedBuffer);
+		try {
+			// 全ての画像を取得
+			const imageBuffers = [];
+			for (const imageUrl of postData.images) {
+				try {
+					const imageResponse = await fetch(imageUrl);
+					const imageBuffer = await imageResponse.arrayBuffer();
+					imageBuffers.push(imageBuffer);
+				} catch (error) {
+					console.error('Error loading image:', error);
+				}
+			}
+			
+			if (imageBuffers.length > 0) {
+				// 複数画像の場合はグリッド化、1枚の場合はそのまま
+				const gridBuffer = await createImageGrid(imageBuffers);
+				const base64Image = arrayBufferToBase64(gridBuffer);
 				
 				parts.push({
 					inlineData: {
@@ -305,9 +314,11 @@ ${postData.text}
 						data: base64Image,
 					},
 				});
-			} catch (error) {
-				console.error('Error loading image:', error);
+				
+				console.log(`Sent ${imageBuffers.length} image(s) as grid to Gemini`);
 			}
+		} catch (error) {
+			console.error('Error processing images:', error);
 		}
 	}
 
@@ -410,6 +421,132 @@ async function resizeImage(imageBuffer, maxWidth = 640, maxHeight = 360) {
 		console.error('Image resize failed, using original:', error);
 		// リサイズ失敗時は元の画像を返す
 		return imageBuffer;
+	}
+}
+
+// 複数の画像をグリッド化して1枚にまとめる関数
+async function createImageGrid(imageBuffers) {
+	try {
+		const imageCount = imageBuffers.length;
+		
+		// 1枚の場合はそのまま返す
+		if (imageCount === 1) {
+			console.log('Single image, no grid needed');
+			return imageBuffers[0];
+		}
+		
+		// 各画像をPhotonImageに変換
+		const photonImages = imageBuffers.map(buffer => 
+			PhotonImage.new_from_byteslice(new Uint8Array(buffer))
+		);
+		
+		// グリッドレイアウトを決定
+		let cols, rows;
+		if (imageCount === 2) {
+			cols = 2;
+			rows = 1;
+		} else if (imageCount === 3 || imageCount === 4) {
+			cols = 2;
+			rows = 2;
+		}
+		
+		// 各画像のサイズを取得し、最大サイズを計算
+		const imageSizes = photonImages.map(img => ({
+			width: img.get_width(),
+			height: img.get_height()
+		}));
+		
+		// セルごとの最大サイズを計算（グリッド全体が2000x2000以内に収まるように）
+		const maxCellWidth = Math.floor(2000 / cols);
+		const maxCellHeight = Math.floor(2000 / rows);
+		
+		// 各画像をセルサイズに合わせてリサイズ
+		const resizedImages = [];
+		for (let i = 0; i < photonImages.length; i++) {
+			const img = photonImages[i];
+			const originalWidth = img.get_width();
+			const originalHeight = img.get_height();
+			
+			// アスペクト比を維持してリサイズ
+			const aspectRatio = originalWidth / originalHeight;
+			let newWidth, newHeight;
+			
+			if (aspectRatio > maxCellWidth / maxCellHeight) {
+				newWidth = maxCellWidth;
+				newHeight = Math.round(maxCellWidth / aspectRatio);
+			} else {
+				newHeight = maxCellHeight;
+				newWidth = Math.round(maxCellHeight * aspectRatio);
+			}
+			
+			const resizedImg = resize(img, newWidth, newHeight, SamplingFilter.Nearest);
+			resizedImages.push({
+				image: resizedImg,
+				width: newWidth,
+				height: newHeight
+			});
+			
+			// 元の画像を解放
+			img.free();
+		}
+		
+		// グリッド全体のサイズを計算
+		const gridWidth = maxCellWidth * cols;
+		const gridHeight = maxCellHeight * rows;
+		
+		console.log(`Creating ${cols}x${rows} grid (${gridWidth}x${gridHeight})`);
+		
+		// 白いキャンバスを作成
+		const canvas = new Uint8Array(gridWidth * gridHeight * 4);
+		canvas.fill(255); // 白で塗りつぶし
+		
+		// 各画像をグリッドに配置
+		let imageIndex = 0;
+		for (let row = 0; row < rows; row++) {
+			for (let col = 0; col < cols; col++) {
+				if (imageIndex >= resizedImages.length) break;
+				
+				const { image, width, height } = resizedImages[imageIndex];
+				const rawPixels = image.get_raw_pixels();
+				
+				// セル内で中央配置
+				const offsetX = col * maxCellWidth + Math.floor((maxCellWidth - width) / 2);
+				const offsetY = row * maxCellHeight + Math.floor((maxCellHeight - height) / 2);
+				
+				// ピクセルをコピー
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						const srcIndex = (y * width + x) * 4;
+						const dstIndex = ((offsetY + y) * gridWidth + (offsetX + x)) * 4;
+						
+						canvas[dstIndex] = rawPixels[srcIndex];         // R
+						canvas[dstIndex + 1] = rawPixels[srcIndex + 1]; // G
+						canvas[dstIndex + 2] = rawPixels[srcIndex + 2]; // B
+						canvas[dstIndex + 3] = rawPixels[srcIndex + 3]; // A
+					}
+				}
+				
+				imageIndex++;
+			}
+		}
+		
+		// グリッド画像をPhotonImageとして作成
+		const gridImage = new PhotonImage(canvas, gridWidth, gridHeight);
+		
+		// JPEG形式でエンコード
+		const outputBytes = gridImage.get_bytes_jpeg(85);
+		
+		// メモリ解放
+		resizedImages.forEach(({ image }) => image.free());
+		gridImage.free();
+		
+		console.log(`Grid image created successfully: ${gridWidth}x${gridHeight}`);
+		
+		return outputBytes.buffer;
+	} catch (error) {
+		console.error('Grid creation failed, using first image:', error);
+		// グリッド作成失敗時は最初の画像を返す
+		return imageBuffers[0];
 	}
 }
 
