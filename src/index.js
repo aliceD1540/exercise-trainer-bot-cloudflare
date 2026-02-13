@@ -42,6 +42,7 @@ const RULES = `# Gemini 回答生成ルール
 1.  **採点（xx点）：** 最初に100点満点で採点結果を提示します。
 2.  **褒め言葉:** トレーニングの良い点を1つ、具体的に褒めます。
 3.  **応援メッセージ:** 現在の日時に応じた短い励ましの言葉で締めくくります。平日と休日は区別してください。
+4.  **履歴情報（区切り線以降）:** 回答の最後に「---」で区切り、次回評価用の履歴情報を記載してください。
 
 ## 採点基準
 
@@ -52,6 +53,21 @@ const RULES = `# Gemini 回答生成ルール
     -   80点: 運動時間が30分以上、継続日数が1日以上
     -   70点: 運動時間が30分以上、継続日数が1日未満
 -   1週間のうち1,2日程度の休みであれば休息日として評価、継続しているものとしてください。
+
+## 履歴情報の記載方法
+
+回答の最後に「---」で区切り、以下の情報を箇条書きで記載してください：
+-   最後にトレーニングした日：YYYY-MM-DD形式
+-   連続でトレーニングしている日数：数値のみ
+-   その他の観察事項（体重の変化、運動内容の変化など）：簡潔に
+
+例：
+---
+- 最後にトレーニングした日：2026-01-01
+- 連続でトレーニングしている日数：7
+- その他：ランニングとウェイトトレーニングを交互に実施
+
+※この履歴情報は次回の評価時に参考情報として使用されます。ユーザーには表示されません。
 
 ## スタイル
 
@@ -240,6 +256,8 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 
 	// 会話の続きの場合は簡単な返答用プロンプト
 	let prompt;
+	let shouldSaveHistory = false;
+	
 	if (isSimpleReply) {
 		prompt = `あなたはフレンドリーなフィットネストレーナーです。ユーザーの返信に対して、30文字程度の自然で簡潔な返答をしてください。
 
@@ -250,7 +268,22 @@ ${postData.text}
 
 ※ルールに従った評価は不要です。会話を続けようとせず、感謝や応援の気持ちを伝える簡潔な返答をしてください。`;
 	} else {
-		prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n時間帯: ${timeOfDay}\n\n`;
+		// 通常の評価の場合は履歴情報を取得してプロンプトに含める
+		shouldSaveHistory = true;
+		const history = await getExerciseHistory(postData.author, env);
+		
+		let historyContext = '';
+		if (history.lastTrainingDate) {
+			historyContext = '\n\n# 前回までの履歴情報:\n';
+			historyContext += `- 最後にトレーニングした日：${history.lastTrainingDate}\n`;
+			historyContext += `- 連続でトレーニングしている日数：${history.consecutiveDays}\n`;
+			if (history.notes) {
+				historyContext += `- その他：${history.notes}\n`;
+			}
+			historyContext += '\n※この履歴情報を考慮して評価してください。';
+		}
+		
+		prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n時間帯: ${timeOfDay}${historyContext}\n\n`;
 	}
 
 	// 画像がある場合は画像も含めて送信
@@ -281,6 +314,19 @@ ${postData.text}
 	try {
 		const result = await model.generateContent(parts);
 		let responseText = result.response.text();
+
+		// 履歴情報を保存する必要がある場合は、レスポンスをパースして履歴情報を抽出
+		if (shouldSaveHistory) {
+			const parsed = parseAIResponse(responseText);
+			
+			// 履歴情報が含まれている場合は保存
+			if (parsed.history && parsed.history.lastTrainingDate) {
+				await saveExerciseHistory(postData.author, parsed.history, env);
+			}
+			
+			// ユーザーへの返信は履歴情報を除外したテキストのみ
+			responseText = parsed.displayText;
+		}
 
 		// 簡単な返答の場合は50文字、通常は300文字制限
 		const maxLength = isSimpleReply ? 50 : 300;
@@ -743,4 +789,92 @@ async function cleanupOldProcessedNotifications(env) {
 	} catch (error) {
 		console.error('Error cleaning up processed notifications:', error);
 	}
+}
+
+// ユーザーの運動履歴を取得
+async function getExerciseHistory(did, env) {
+	try {
+		const key = `exercise_history_${did}`;
+		const historyData = await env.EXERCISE_TRAINER_SESSIONS.get(key);
+		
+		if (historyData) {
+			return JSON.parse(historyData);
+		}
+		
+		// 履歴がない場合は空のオブジェクトを返す
+		return {
+			lastTrainingDate: null,
+			consecutiveDays: 0,
+			notes: ''
+		};
+	} catch (error) {
+		console.error('Error getting exercise history:', error);
+		return {
+			lastTrainingDate: null,
+			consecutiveDays: 0,
+			notes: ''
+		};
+	}
+}
+
+// ユーザーの運動履歴を保存
+async function saveExerciseHistory(did, history, env) {
+	try {
+		const key = `exercise_history_${did}`;
+		await env.EXERCISE_TRAINER_SESSIONS.put(key, JSON.stringify(history));
+		console.log('Saved exercise history for', did, ':', history);
+	} catch (error) {
+		console.error('Error saving exercise history:', error);
+	}
+}
+
+// AI応答から履歴情報を抽出
+function parseAIResponse(responseText) {
+	const parts = responseText.split('---');
+	
+	if (parts.length < 2) {
+		// 履歴情報がない場合はそのまま返す
+		return {
+			displayText: responseText.trim(),
+			history: null
+		};
+	}
+	
+	const displayText = parts[0].trim();
+	const historyText = parts.slice(1).join('---').trim();
+	
+	// 履歴情報をパース
+	const history = {
+		lastTrainingDate: null,
+		consecutiveDays: 0,
+		notes: ''
+	};
+	
+	const lines = historyText.split('\n');
+	for (const line of lines) {
+		const trimmedLine = line.trim();
+		
+		// 最後にトレーニングした日を抽出
+		const dateMatch = trimmedLine.match(/最後にトレーニングした日[：:]\s*(\d{4}-\d{2}-\d{2})/);
+		if (dateMatch) {
+			history.lastTrainingDate = dateMatch[1];
+		}
+		
+		// 連続日数を抽出
+		const daysMatch = trimmedLine.match(/連続でトレーニングしている日数[：:]\s*(\d+)/);
+		if (daysMatch) {
+			history.consecutiveDays = parseInt(daysMatch[1], 10);
+		}
+		
+		// その他の観察事項を抽出
+		const notesMatch = trimmedLine.match(/その他[：:]\s*(.+)/);
+		if (notesMatch) {
+			history.notes = notesMatch[1].trim();
+		}
+	}
+	
+	return {
+		displayText,
+		history
+	};
 }
