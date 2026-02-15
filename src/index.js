@@ -31,6 +31,67 @@ function getTimeOfDay(jstDate) {
 	return '夜';
 }
 
+/**
+ * 日本時間を運動記録用の日付（YYYY-MM-DD）に変換
+ * 深夜3時より前は前日扱いとする
+ * @param {Date} jstDate 日本時間のDateオブジェクト
+ * @returns {string} YYYY-MM-DD形式の日付文字列
+ */
+function getExerciseDate(jstDate) {
+	const hour = jstDate.getHours();
+	let targetDate = new Date(jstDate);
+	
+	// 深夜0時～3時の場合は前日扱い
+	if (hour < 3) {
+		targetDate.setDate(targetDate.getDate() - 1);
+	}
+	
+	const year = targetDate.getFullYear();
+	const month = String(targetDate.getMonth() + 1).padStart(2, '0');
+	const day = String(targetDate.getDate()).padStart(2, '0');
+	
+	return `${year}-${month}-${day}`;
+}
+
+/**
+ * 投稿日時から継続日数を計算
+ * @param {string} currentPostCreatedAt 現在の投稿のcreatedAt（ISO 8601形式）
+ * @param {string|null} lastTrainingDate 前回の運動記録日（YYYY-MM-DD形式）
+ * @param {number} previousConsecutiveDays 前回の継続日数
+ * @returns {number} 新しい継続日数
+ */
+function calculateConsecutiveDays(currentPostCreatedAt, lastTrainingDate, previousConsecutiveDays) {
+	// 投稿日時をJSTに変換
+	const postDate = new Date(currentPostCreatedAt);
+	const jstPostDate = new Date(postDate.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+	
+	// 運動記録用の日付を取得（深夜3時区切り）
+	const currentExerciseDate = getExerciseDate(jstPostDate);
+	
+	// 初回の場合
+	if (!lastTrainingDate) {
+		return 1;
+	}
+	
+	// 同じ日の場合は継続日数を維持
+	if (currentExerciseDate === lastTrainingDate) {
+		return previousConsecutiveDays;
+	}
+	
+	// 前回の日付から日数差を計算
+	const lastDate = new Date(lastTrainingDate + 'T00:00:00+09:00');
+	const currentDate = new Date(currentExerciseDate + 'T00:00:00+09:00');
+	const daysDiff = Math.floor((currentDate - lastDate) / (24 * 60 * 60 * 1000));
+	
+	// 1日後なら継続日数を増やす
+	if (daysDiff === 1) {
+		return previousConsecutiveDays + 1;
+	}
+	
+	// 2日以上空いた場合はリセット
+	return 1;
+}
+
 const RULES = `# Gemini 回答生成ルール
 
 あなたはプロのフィットネストレーナーであり、Blueskyに投稿するボットです。
@@ -57,17 +118,15 @@ const RULES = `# Gemini 回答生成ルール
 ## 履歴情報の記載方法
 
 回答の最後に「---」で区切り、以下の情報を箇条書きで記載してください：
--   最後にトレーニングした日：YYYY-MM-DD形式
--   連続でトレーニングしている日数：数値のみ
 -   その他の観察事項：**100文字程度まで**、直近のトレーニング情報を具体的に記載
     -   運動内容の変化（ランニング、筋トレ、ヨガなど）
     -   体調の変化（痛み、疲労、好調など）
     -   特記事項（中断理由、達成事項、課題など）
 
+**重要：「最後にトレーニングした日」と「連続でトレーニングしている日数」は投稿日時から自動計算されるため、記載不要です。**
+
 例：
 ---
-- 最後にトレーニングした日：2026-01-01
-- 連続でトレーニングしている日数：7
 - その他：ランニング3km実施。前日は足に軽い痛みがあったが今日は問題なし。ウェイトトレーニングとの交互実施を継続中。
 
 ※この履歴情報は次回の評価時に参考情報として使用され、前日の情報を踏まえた上でのコメント生成に活用されます。ユーザーには表示されません。
@@ -283,15 +342,34 @@ ${postData.text}
 		shouldSaveHistory = true;
 		const history = await getExerciseHistory(postData.author, env);
 		
+		// 投稿日時から継続日数を計算
+		const consecutiveDays = calculateConsecutiveDays(
+			postData.created_at,
+			history.lastTrainingDate,
+			history.consecutiveDays
+		);
+		
+		// 計算した継続日数をpostDataに追加（後で保存するため）
+		postData.calculatedConsecutiveDays = consecutiveDays;
+		
+		// 投稿日時から運動記録日を取得
+		const postDate = new Date(postData.created_at);
+		const jstPostDate = new Date(postDate.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+		postData.calculatedExerciseDate = getExerciseDate(jstPostDate);
+		
 		let historyContext = '';
 		if (history.lastTrainingDate) {
 			historyContext = '\n\n# 前回までの履歴情報:\n';
 			historyContext += `- 最後にトレーニングした日：${history.lastTrainingDate}\n`;
-			historyContext += `- 連続でトレーニングしている日数：${history.consecutiveDays}\n`;
+			historyContext += `- 連続でトレーニングしている日数：${consecutiveDays}\n`;
 			if (history.notes) {
 				historyContext += `- その他：${history.notes}\n`;
 			}
 			historyContext += '\n※この履歴情報を考慮して評価してください。';
+		} else {
+			historyContext = '\n\n# 前回までの履歴情報:\n';
+			historyContext += '- これが初回のトレーニング記録です\n';
+			historyContext += `- 連続でトレーニングしている日数：1\n`;
 		}
 		
 		prompt = `${RULES}\n\n# 投稿内容:\n${postData.text}\n\n現在の日時: ${formattedTime}\n時間帯: ${timeOfDay}${historyContext}\n\n`;
@@ -341,10 +419,16 @@ ${postData.text}
 		if (shouldSaveHistory) {
 			const parsed = parseAIResponse(responseText);
 			
-			// 履歴情報が含まれている場合は保存
-			if (parsed.history && parsed.history.lastTrainingDate) {
-				await saveExerciseHistory(postData.author, parsed.history, env);
-			}
+			// 投稿日時から計算した継続日数と運動記録日を使用
+			const history = {
+				lastTrainingDate: postData.calculatedExerciseDate,
+				consecutiveDays: postData.calculatedConsecutiveDays,
+				notes: parsed.history?.notes || ''
+			};
+			
+			// 履歴情報を保存
+			await saveExerciseHistory(postData.author, history, env);
+			console.log('Saved history with calculated consecutive days:', history);
 			
 			// ユーザーへの返信は履歴情報を除外したテキストのみ
 			responseText = parsed.displayText;
@@ -991,28 +1075,14 @@ function parseAIResponse(responseText) {
 	const displayText = parts[0].trim();
 	const historyText = parts.slice(1).join('---').trim();
 	
-	// 履歴情報をパース
+	// 履歴情報をパース（その他の観察事項のみ）
 	const history = {
-		lastTrainingDate: null,
-		consecutiveDays: 0,
 		notes: ''
 	};
 	
 	const lines = historyText.split('\n');
 	for (const line of lines) {
 		const trimmedLine = line.trim();
-		
-		// 最後にトレーニングした日を抽出
-		const dateMatch = trimmedLine.match(/最後にトレーニングした日[：:]\s*(\d{4}-\d{2}-\d{2})/);
-		if (dateMatch) {
-			history.lastTrainingDate = dateMatch[1];
-		}
-		
-		// 連続日数を抽出
-		const daysMatch = trimmedLine.match(/連続でトレーニングしている日数[：:]\s*(\d+)/);
-		if (daysMatch) {
-			history.consecutiveDays = parseInt(daysMatch[1], 10);
-		}
 		
 		// その他の観察事項を抽出
 		const notesMatch = trimmedLine.match(/その他[：:]\s*(.+)/);
