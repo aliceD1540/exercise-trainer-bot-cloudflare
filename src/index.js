@@ -8,8 +8,8 @@ import { PhotonImage, resize, SamplingFilter } from '@cf-wasm/photon';
  */
 function getJSTDate() {
 	const now = new Date();
-	// 日本時間に変換（UTC+9時間）
-	return new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+	// UTC時刻に9時間を加算してJSTに変換
+	return new Date(now.getTime() + 9 * 60 * 60 * 1000);
 }
 
 /**
@@ -61,9 +61,9 @@ function getExerciseDate(jstDate) {
  * @returns {number} 新しい継続日数
  */
 function calculateConsecutiveDays(currentPostCreatedAt, lastTrainingDate, previousConsecutiveDays) {
-	// 投稿日時をJSTに変換
+	// 投稿日時をUTC → JSTに変換
 	const postDate = new Date(currentPostCreatedAt);
-	const jstPostDate = new Date(postDate.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+	const jstPostDate = new Date(postDate.getTime() + 9 * 60 * 60 * 1000);
 	
 	// 運動記録用の日付を取得（深夜3時区切り）
 	const currentExerciseDate = getExerciseDate(jstPostDate);
@@ -118,22 +118,21 @@ const RULES = `# Gemini 回答生成ルール
 ## 履歴情報の記載方法
 
 回答の最後に「---」で区切り、以下の情報を箇条書きで記載してください：
--   その他の観察事項：**100文字程度まで**、直近のトレーニング情報を具体的に記載
+-   その他：**100文字程度まで**、直近のトレーニング情報を具体的に記載
     -   運動内容の変化（ランニング、筋トレ、ヨガなど）
     -   体調の変化（痛み、疲労、好調など）
     -   特記事項（中断理由、達成事項、課題など）
-
-**重要：「最後にトレーニングした日」と「連続でトレーニングしている日数」は投稿日時から自動計算されるため、記載不要です。**
 
 例：
 ---
 - その他：ランニング3km実施。前日は足に軽い痛みがあったが今日は問題なし。ウェイトトレーニングとの交互実施を継続中。
 
-※この履歴情報は次回の評価時に参考情報として使用され、前日の情報を踏まえた上でのコメント生成に活用されます。ユーザーには表示されません。
+※この履歴情報は次回の評価時に参考情報として使用されます。ユーザーには表示されません。
 
 ## 履歴情報の活用方法
 
 前回までの履歴情報が提供されている場合、以下のように活用してください：
+-   継続日数を見て、トレーニングの継続性を評価・応援する
 -   前回の体調不良や痛みが記録されている場合：今回の投稿で問題なくトレーニングできていれば、回復を喜ぶコメントを含める
     -   例：「足の痛みは大丈夫ですか？ 回復したのであればなによりです！」
 -   前回のトレーニング内容を参考に、継続性や変化を評価する
@@ -352,9 +351,9 @@ ${postData.text}
 		// 計算した継続日数をpostDataに追加（後で保存するため）
 		postData.calculatedConsecutiveDays = consecutiveDays;
 		
-		// 投稿日時から運動記録日を取得
+		// 投稿日時から運動記録日を取得（UTC → JSTに変換）
 		const postDate = new Date(postData.created_at);
-		const jstPostDate = new Date(postDate.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+		const jstPostDate = new Date(postDate.getTime() + 9 * 60 * 60 * 1000);
 		postData.calculatedExerciseDate = getExerciseDate(jstPostDate);
 		
 		let historyContext = '';
