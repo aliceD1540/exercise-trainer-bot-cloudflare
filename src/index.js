@@ -212,12 +212,10 @@ async function handleScheduled(env) {
 	const since = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
 	const until = now.toISOString();
 
-	console.log('Searching posts:', { since, until });
-
 	// 検索制限を削減してAPI呼び出しを軽量化
 	const posts = await bsky.searchPosts({
 		query: '#青空筋トレ部',
-		limit: 30,
+		limit: 20,
 		author: env.CHECK_BSKY_DID,
 		since,
 		until,
@@ -280,8 +278,6 @@ async function handleScheduled(env) {
 			if (!latestPostTime || postTime > latestPostTime) {
 				latestPostTime = postTime;
 			}
-			
-			console.log('Replied to post:', post.uri);
 		} catch (error) {
 			console.error('Error processing post:', error.message);
 		}
@@ -463,7 +459,7 @@ function arrayBufferToBase64(buffer) {
 }
 
 // 画像をリサイズする関数（アスペクト比を維持）
-async function resizeImage(imageBuffer, maxWidth = 512, maxHeight = 512) {
+async function resizeImage(imageBuffer, maxWidth = 400, maxHeight = 400) {
 	try {
 		// バイト配列からPhotonImageを作成
 		const inputImage = PhotonImage.new_from_byteslice(new Uint8Array(imageBuffer));
@@ -493,8 +489,8 @@ async function resizeImage(imageBuffer, maxWidth = 512, maxHeight = 512) {
 		// リサイズ実行（Nearest: 高速、品質は中程度）
 		const outputImage = resize(inputImage, newWidth, newHeight, SamplingFilter.Nearest);
 		
-		// JPEG形式でエンコード（品質を70に下げて処理時間短縮）
-		const outputBytes = outputImage.get_bytes_jpeg(70);
+		// JPEG形式でエンコード（品質を60に下げて処理時間短縮）
+		const outputBytes = outputImage.get_bytes_jpeg(60);
 		
 		// メモリ解放
 		inputImage.free();
@@ -529,9 +525,9 @@ async function createImageGrid(imageBuffers) {
 			rows = 2;
 		}
 		
-		// グリッド全体を1600x1600に削減（CPU負荷軽減）
-		const maxCellWidth = Math.floor(1600 / cols);
-		const maxCellHeight = Math.floor(1600 / rows);
+		// グリッド全体を1200x1200に削減（CPU負荷軽減）
+		const maxCellWidth = Math.floor(1200 / cols);
+		const maxCellHeight = Math.floor(1200 / rows);
 		
 		const resizedImages = [];
 		for (let i = 0; i < photonImages.length; i++) {
@@ -595,8 +591,8 @@ async function createImageGrid(imageBuffers) {
 		
 		const gridImage = new PhotonImage(canvas, gridWidth, gridHeight);
 		
-		// 品質を75に下げて処理時間短縮
-		const outputBytes = gridImage.get_bytes_jpeg(75);
+		// 品質を60に下げて処理時間短縮
+		const outputBytes = gridImage.get_bytes_jpeg(60);
 		
 		resizedImages.forEach(({ image }) => image.free());
 		gridImage.free();
@@ -792,10 +788,8 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 // Botへの通知（メンション/リプライ）を処理
 async function handleNotifications(env, bsky) {
 	try {
-		console.log('Checking notifications...');
-		
 		// 通知取得も制限を削減
-		const notifications = await bsky.getNotifications({ limit: 30 });
+		const notifications = await bsky.getNotifications({ limit: 20 });
 		
 		if (!notifications || !notifications.data || !notifications.data.notifications || !Array.isArray(notifications.data.notifications)) {
 			return;
@@ -869,7 +863,6 @@ async function handleNotifications(env, bsky) {
 					// ボットへのリプライ（会話の続き）なら簡単な返答を生成
 					if (isReplyToBot) {
 						responseText = await analyzeWithGemini(postData, env, true);
-						console.log('Simple reply to conversation:', notification.uri);
 					} else {
 						// 初回のメンションなら通常の評価
 						responseText = await analyzeWithGemini(postData, env, false);
@@ -891,7 +884,6 @@ async function handleNotifications(env, bsky) {
 				await markNotificationAsProcessed(notification.uri, env);
 				newNotificationsCount++;
 				
-				console.log('Replied to notification:', notification.uri);
 			} catch (error) {
 				console.error('Error processing notification:', error);
 			}
