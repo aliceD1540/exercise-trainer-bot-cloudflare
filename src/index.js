@@ -214,27 +214,22 @@ async function handleScheduled(env) {
 
 	console.log('Searching posts:', { since, until });
 
+	// 検索制限を削減してAPI呼び出しを軽量化
 	const posts = await bsky.searchPosts({
 		query: '#青空筋トレ部',
-		limit: 50, // 24時間分なので増加
+		limit: 30,
 		author: env.CHECK_BSKY_DID,
 		since,
 		until,
 	});
 
-	// APIレスポンスの構造を修正: posts.data.posts
 	if (!posts || !posts.data || !posts.data.posts || !Array.isArray(posts.data.posts)) {
-		console.log('No posts found or invalid response structure');
-		// 投稿がない場合でもリマインダーチェックを実行
 		await checkAndSendReminder(env, bsky);
 		return;
 	}
 
-	console.log('Found posts:', posts.data.posts.length);
-
 	// 処理済みポストのURIを取得
 	const processedPosts = await getProcessedPosts(env);
-	console.log('Previously processed posts:', processedPosts.size);
 
 	let newPostsCount = 0;
 	let latestPostTime = null;
@@ -244,7 +239,6 @@ async function handleScheduled(env) {
 	for (const post of posts.data.posts) {
 		// 既に処理済みのポストはスキップ
 		if (processedPosts.has(post.uri)) {
-			console.log('Skipping already processed post:', post.uri);
 			continue;
 		}
 
@@ -289,24 +283,23 @@ async function handleScheduled(env) {
 			
 			console.log('Replied to post:', post.uri);
 		} catch (error) {
-			console.error('Error processing post:', error);
+			console.error('Error processing post:', error.message);
 		}
 	}
 	
-	console.log('Processed new posts:', newPostsCount);
 	
-	// 新しい投稿を処理した場合、最終評価時刻を更新
 	if (latestPostTime) {
 		await updateLastEvaluationTime(latestPostTime.toISOString(), env);
 	}
 	
-	// 古い処理済み記録をクリーンアップ（7日以上前の記録を削除）
-	await cleanupOldProcessedPosts(env);
+	// 10回に1回だけクリーンアップを実行してCPU時間削減
+	const shouldCleanup = Math.random() < 0.1;
+	if (shouldCleanup) {
+		await cleanupOldProcessedPosts(env);
+	}
 	
-	// Botへの通知（メンション/リプライ）を処理
 	await handleNotifications(env, bsky);
 	
-	// リマインダーのチェックと送信
 	await checkAndSendReminder(env, bsky);
 }
 
@@ -383,20 +376,20 @@ ${postData.text}
 	
 	if (postData.images && postData.images.length > 0) {
 		try {
-			// 全ての画像を取得
-			const imageBuffers = [];
-			for (const imageUrl of postData.images) {
+			// 画像処理を並列化してCPU時間削減
+			const imagePromises = postData.images.slice(0, 4).map(async (imageUrl) => {
 				try {
 					const imageResponse = await fetch(imageUrl);
-					const imageBuffer = await imageResponse.arrayBuffer();
-					imageBuffers.push(imageBuffer);
+					return await imageResponse.arrayBuffer();
 				} catch (error) {
-					console.error('Error loading image:', error);
+					console.error('Error loading image:', error.message);
+					return null;
 				}
-			}
+			});
+			
+			const imageBuffers = (await Promise.all(imagePromises)).filter(buf => buf !== null);
 			
 			if (imageBuffers.length > 0) {
-				// 複数画像の場合はグリッド化、1枚の場合はそのまま
 				const gridBuffer = await createImageGrid(imageBuffers);
 				const base64Image = arrayBufferToBase64(gridBuffer);
 				
@@ -406,11 +399,9 @@ ${postData.text}
 						data: base64Image,
 					},
 				});
-				
-				console.log(`Sent ${imageBuffers.length} image(s) as grid to Gemini`);
 			}
 		} catch (error) {
-			console.error('Error processing images:', error);
+			console.error('Error processing images:', error.message);
 		}
 	}
 
@@ -429,11 +420,8 @@ ${postData.text}
 				notes: parsed.history?.notes || ''
 			};
 			
-			// 履歴情報を保存
 			await saveExerciseHistory(postData.author, history, env);
-			console.log('Saved history with calculated consecutive days:', history);
 			
-			// ユーザーへの返信は履歴情報を除外したテキストのみ
 			responseText = parsed.displayText;
 		}
 
@@ -462,17 +450,20 @@ ${postData.text}
 }
 
 function arrayBufferToBase64(buffer) {
-	let binary = '';
 	const bytes = new Uint8Array(buffer);
-	const len = bytes.byteLength;
-	for (let i = 0; i < len; i++) {
-		binary += String.fromCharCode(bytes[i]);
+	const chunkSize = 8192;
+	let binary = '';
+	
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+		binary += String.fromCharCode.apply(null, chunk);
 	}
+	
 	return btoa(binary);
 }
 
 // 画像をリサイズする関数（アスペクト比を維持）
-async function resizeImage(imageBuffer, maxWidth = 640, maxHeight = 360) {
+async function resizeImage(imageBuffer, maxWidth = 512, maxHeight = 512) {
 	try {
 		// バイト配列からPhotonImageを作成
 		const inputImage = PhotonImage.new_from_byteslice(new Uint8Array(imageBuffer));
@@ -483,8 +474,7 @@ async function resizeImage(imageBuffer, maxWidth = 640, maxHeight = 360) {
 		
 		// すでに小さい場合はリサイズしない
 		if (originalWidth <= maxWidth && originalHeight <= maxHeight) {
-			console.log(`Image already small enough: ${originalWidth}x${originalHeight}`);
-			inputImage.free(); // メモリ解放
+			inputImage.free();
 			return imageBuffer;
 		}
 		
@@ -493,22 +483,18 @@ async function resizeImage(imageBuffer, maxWidth = 640, maxHeight = 360) {
 		let newWidth, newHeight;
 		
 		if (aspectRatio > maxWidth / maxHeight) {
-			// 横長: 幅を基準にリサイズ
 			newWidth = maxWidth;
 			newHeight = Math.round(maxWidth / aspectRatio);
 		} else {
-			// 縦長: 高さを基準にリサイズ
 			newHeight = maxHeight;
 			newWidth = Math.round(maxHeight * aspectRatio);
 		}
 		
-		console.log(`Resizing image from ${originalWidth}x${originalHeight} to ${newWidth}x${newHeight}`);
-		
 		// リサイズ実行（Nearest: 高速、品質は中程度）
 		const outputImage = resize(inputImage, newWidth, newHeight, SamplingFilter.Nearest);
 		
-		// JPEG形式でエンコード（品質80）
-		const outputBytes = outputImage.get_bytes_jpeg(80);
+		// JPEG形式でエンコード（品質を70に下げて処理時間短縮）
+		const outputBytes = outputImage.get_bytes_jpeg(70);
 		
 		// メモリ解放
 		inputImage.free();
@@ -516,8 +502,7 @@ async function resizeImage(imageBuffer, maxWidth = 640, maxHeight = 360) {
 		
 		return outputBytes.buffer;
 	} catch (error) {
-		console.error('Image resize failed, using original:', error);
-		// リサイズ失敗時は元の画像を返す
+		console.error('Image resize failed:', error.message);
 		return imageBuffer;
 	}
 }
@@ -527,18 +512,14 @@ async function createImageGrid(imageBuffers) {
 	try {
 		const imageCount = imageBuffers.length;
 		
-		// 1枚の場合はそのまま返す
 		if (imageCount === 1) {
-			console.log('Single image, no grid needed');
 			return imageBuffers[0];
 		}
 		
-		// 各画像をPhotonImageに変換
 		const photonImages = imageBuffers.map(buffer => 
 			PhotonImage.new_from_byteslice(new Uint8Array(buffer))
 		);
 		
-		// グリッドレイアウトを決定
 		let cols, rows;
 		if (imageCount === 2) {
 			cols = 2;
@@ -548,24 +529,16 @@ async function createImageGrid(imageBuffers) {
 			rows = 2;
 		}
 		
-		// 各画像のサイズを取得し、最大サイズを計算
-		const imageSizes = photonImages.map(img => ({
-			width: img.get_width(),
-			height: img.get_height()
-		}));
+		// グリッド全体を1600x1600に削減（CPU負荷軽減）
+		const maxCellWidth = Math.floor(1600 / cols);
+		const maxCellHeight = Math.floor(1600 / rows);
 		
-		// セルごとの最大サイズを計算（グリッド全体が2000x2000以内に収まるように）
-		const maxCellWidth = Math.floor(2000 / cols);
-		const maxCellHeight = Math.floor(2000 / rows);
-		
-		// 各画像をセルサイズに合わせてリサイズ
 		const resizedImages = [];
 		for (let i = 0; i < photonImages.length; i++) {
 			const img = photonImages[i];
 			const originalWidth = img.get_width();
 			const originalHeight = img.get_height();
 			
-			// アスペクト比を維持してリサイズ
 			const aspectRatio = originalWidth / originalHeight;
 			let newWidth, newHeight;
 			
@@ -584,21 +557,15 @@ async function createImageGrid(imageBuffers) {
 				height: newHeight
 			});
 			
-			// 元の画像を解放
 			img.free();
 		}
 		
-		// グリッド全体のサイズを計算
 		const gridWidth = maxCellWidth * cols;
 		const gridHeight = maxCellHeight * rows;
 		
-		console.log(`Creating ${cols}x${rows} grid (${gridWidth}x${gridHeight})`);
-		
-		// 白いキャンバスを作成
 		const canvas = new Uint8Array(gridWidth * gridHeight * 4);
-		canvas.fill(255); // 白で塗りつぶし
+		canvas.fill(255);
 		
-		// 各画像をグリッドに配置
 		let imageIndex = 0;
 		for (let row = 0; row < rows; row++) {
 			for (let col = 0; col < cols; col++) {
@@ -607,20 +574,18 @@ async function createImageGrid(imageBuffers) {
 				const { image, width, height } = resizedImages[imageIndex];
 				const rawPixels = image.get_raw_pixels();
 				
-				// セル内で中央配置
 				const offsetX = col * maxCellWidth + Math.floor((maxCellWidth - width) / 2);
 				const offsetY = row * maxCellHeight + Math.floor((maxCellHeight - height) / 2);
 				
-				// ピクセルをコピー
 				for (let y = 0; y < height; y++) {
 					for (let x = 0; x < width; x++) {
 						const srcIndex = (y * width + x) * 4;
 						const dstIndex = ((offsetY + y) * gridWidth + (offsetX + x)) * 4;
 						
-						canvas[dstIndex] = rawPixels[srcIndex];         // R
-						canvas[dstIndex + 1] = rawPixels[srcIndex + 1]; // G
-						canvas[dstIndex + 2] = rawPixels[srcIndex + 2]; // B
-						canvas[dstIndex + 3] = rawPixels[srcIndex + 3]; // A
+						canvas[dstIndex] = rawPixels[srcIndex];
+						canvas[dstIndex + 1] = rawPixels[srcIndex + 1];
+						canvas[dstIndex + 2] = rawPixels[srcIndex + 2];
+						canvas[dstIndex + 3] = rawPixels[srcIndex + 3];
 					}
 				}
 				
@@ -628,22 +593,17 @@ async function createImageGrid(imageBuffers) {
 			}
 		}
 		
-		// グリッド画像をPhotonImageとして作成
 		const gridImage = new PhotonImage(canvas, gridWidth, gridHeight);
 		
-		// JPEG形式でエンコード
-		const outputBytes = gridImage.get_bytes_jpeg(85);
+		// 品質を75に下げて処理時間短縮
+		const outputBytes = gridImage.get_bytes_jpeg(75);
 		
-		// メモリ解放
 		resizedImages.forEach(({ image }) => image.free());
 		gridImage.free();
 		
-		console.log(`Grid image created successfully: ${gridWidth}x${gridHeight}`);
-		
 		return outputBytes.buffer;
 	} catch (error) {
-		console.error('Grid creation failed, using first image:', error);
-		// グリッド作成失敗時は最初の画像を返す
+		console.error('Grid creation failed:', error.message);
 		return imageBuffers[0];
 	}
 }
@@ -709,9 +669,8 @@ async function cleanupOldProcessedPosts(env) {
 async function updateLastEvaluationTime(time, env) {
 	try {
 		await env.EXERCISE_TRAINER_SESSIONS.put('last_evaluation_time', time);
-		console.log('Updated last evaluation time:', time);
 	} catch (error) {
-		console.error('Error updating last evaluation time:', error);
+		console.error('Error updating last evaluation time:', error.message);
 	}
 }
 
@@ -730,9 +689,8 @@ async function getLastEvaluationTime(env) {
 async function updateLastReminderTime(time, env) {
 	try {
 		await env.EXERCISE_TRAINER_SESSIONS.put('last_reminder_time', time);
-		console.log('Updated last reminder time:', time);
 	} catch (error) {
-		console.error('Error updating last reminder time:', error);
+		console.error('Error updating last reminder time:', error.message);
 	}
 }
 
@@ -754,52 +712,37 @@ async function checkAndSendReminder(env, bsky) {
 		const lastEvaluationTime = await getLastEvaluationTime(env);
 		const lastReminderTime = await getLastReminderTime(env);
 		
-		// 最終評価時刻がない場合は何もしない（初回実行時など）
 		if (!lastEvaluationTime) {
-			console.log('No last evaluation time found, skipping reminder check');
 			return;
 		}
 		
 		const hoursSinceEvaluation = (now - lastEvaluationTime) / (1000 * 60 * 60);
-		console.log(`Hours since last evaluation: ${hoursSinceEvaluation.toFixed(2)}`);
 		
 		const initialHours = parseFloat(env.REMINDER_INITIAL_HOURS) || 72;
-		// 初回リマインダーの時間経過していない場合は何もしない
 		if (hoursSinceEvaluation < initialHours) {
-			console.log(`Less than ${initialHours} hours since last evaluation, no reminder needed`);
 			return;
 		}
 		
-		// リマインダーを送信済みの場合、指定時間経過しているかチェック
 		if (lastReminderTime) {
 			const hoursSinceReminder = (now - lastReminderTime) / (1000 * 60 * 60);
-			console.log(`Hours since last reminder: ${hoursSinceReminder.toFixed(2)}`);
 			
 			const intervalHours = parseFloat(env.REMINDER_INTERVAL_HOURS) || 24;
 			if (hoursSinceReminder < intervalHours) {
-				console.log(`Less than ${intervalHours} hours since last reminder, skipping`);
 				return;
 			}
 		}
 		
-		// リマインダーメッセージを生成して送信
-		console.log('Sending reminder message...');
 		const reminderText = await generateReminderMessage(env, hoursSinceEvaluation);
 		
-		// ユーザーの最新投稿を取得してリプライとして送信
-		// （リプライ先がない場合は通常投稿として送信）
 		const profile = await bsky.getProfile(env.CHECK_BSKY_DID);
 		const handle = profile.data.handle;
 		
-		// @ハンドルをつけて投稿
 		const messageWithMention = `@${handle} ${reminderText}`;
 		await bsky.postText(messageWithMention);
 		
-		// 最終リマインダー送信時刻を更新
 		await updateLastReminderTime(now.toISOString(), env);
-		console.log('Reminder sent successfully');
 	} catch (error) {
-		console.error('Error checking and sending reminder:', error);
+		console.error('Error checking and sending reminder:', error.message);
 	}
 }
 
@@ -851,19 +794,14 @@ async function handleNotifications(env, bsky) {
 	try {
 		console.log('Checking notifications...');
 		
-		// 通知を取得
-		const notifications = await bsky.getNotifications({ limit: 50 });
+		// 通知取得も制限を削減
+		const notifications = await bsky.getNotifications({ limit: 30 });
 		
 		if (!notifications || !notifications.data || !notifications.data.notifications || !Array.isArray(notifications.data.notifications)) {
-			console.log('No notifications found or invalid response structure');
 			return;
 		}
 		
-		console.log('Found notifications:', notifications.data.notifications.length);
-		
-		// 処理済み通知のURIを取得
 		const processedNotifications = await getProcessedNotifications(env);
-		console.log('Previously processed notifications:', processedNotifications.size);
 		
 		let newNotificationsCount = 0;
 		
@@ -880,7 +818,6 @@ async function handleNotifications(env, bsky) {
 			
 			// 既に処理済みの通知はスキップ
 			if (processedNotifications.has(notification.uri)) {
-				console.log('Skipping already processed notification:', notification.uri);
 				continue;
 			}
 			
@@ -960,12 +897,13 @@ async function handleNotifications(env, bsky) {
 			}
 		}
 		
-		console.log('Processed new notifications:', newNotificationsCount);
-		
-		// 処理済み通知の記録をクリーンアップ（7日以上前の記録を削除）
-		await cleanupOldProcessedNotifications(env);
+		// 10回に1回だけクリーンアップを実行
+		const shouldCleanup = Math.random() < 0.1;
+		if (shouldCleanup) {
+			await cleanupOldProcessedNotifications(env);
+		}
 	} catch (error) {
-		console.error('Error handling notifications:', error);
+		console.error('Error handling notifications:', error.message);
 	}
 }
 
@@ -1043,7 +981,7 @@ async function getExerciseHistory(did, env) {
 			notes: ''
 		};
 	} catch (error) {
-		console.error('Error getting exercise history:', error);
+		console.error('Error getting exercise history:', error.message);
 		return {
 			lastTrainingDate: null,
 			consecutiveDays: 0,
@@ -1052,14 +990,12 @@ async function getExerciseHistory(did, env) {
 	}
 }
 
-// ユーザーの運動履歴を保存
 async function saveExerciseHistory(did, history, env) {
 	try {
 		const key = `exercise_history_${did}`;
 		await env.EXERCISE_TRAINER_SESSIONS.put(key, JSON.stringify(history));
-		console.log('Saved exercise history for', did, ':', history);
 	} catch (error) {
-		console.error('Error saving exercise history:', error);
+		console.error('Error saving exercise history:', error.message);
 	}
 }
 
