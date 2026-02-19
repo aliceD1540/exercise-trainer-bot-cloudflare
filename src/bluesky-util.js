@@ -17,17 +17,15 @@ export class BlueskyUtil {
 
 	async loadSession() {
 		try {
-			console.log('Trying to reload session...');
 			const sessionStr = await this.env.EXERCISE_TRAINER_SESSIONS.get('bsky_session');
 			
 			if (sessionStr) {
 				const session = JSON.parse(sessionStr);
 				await this.agent.resumeSession(session);
-				console.log('Session loaded successfully');
 				return true;
 			}
 		} catch (error) {
-			console.log('Failed to load session:', error.message);
+			console.error('Failed to load session:', error.message);
 		}
 		
 		return await this.createSession();
@@ -35,16 +33,14 @@ export class BlueskyUtil {
 
 	async createSession() {
 		try {
-			console.log('Creating new session...');
 			await this.agent.login({
 				identifier: this.env.BSKY_USER_NAME,
 				password: this.env.BSKY_APP_PASS,
 			});
 			await this.saveSession();
-			console.log('New session created');
 			return true;
 		} catch (error) {
-			console.error('Failed to create session:', error);
+			console.error('Failed to create session:', error.message);
 			return false;
 		}
 	}
@@ -91,13 +87,11 @@ export class BlueskyUtil {
 		if (since) params.since = since;
 		if (until) params.until = until;
 
-		console.log('Search params:', params);
-
 		try {
 			const result = await this.agent.app.bsky.feed.searchPosts(params);
 			return result;
 		} catch (error) {
-			console.error('Search posts error:', error);
+			console.error('Search posts error:', error.message);
 			return { data: { posts: [] } };
 		}
 	}
@@ -117,7 +111,7 @@ export class BlueskyUtil {
 			const result = await this.agent.listNotifications(params);
 			return result;
 		} catch (error) {
-			console.error('Get notifications error:', error);
+			console.error('Get notifications error:', error.message);
 			return { data: { notifications: [] } };
 		}
 	}
@@ -127,7 +121,7 @@ export class BlueskyUtil {
 		try {
 			await this.agent.updateSeenNotifications();
 		} catch (error) {
-			console.error('Update seen notifications error:', error);
+			console.error('Update seen notifications error:', error.message);
 		}
 	}
 
@@ -137,7 +131,7 @@ export class BlueskyUtil {
 			const result = await this.agent.getPostThread({ uri, depth: 0 });
 			return result;
 		} catch (error) {
-			console.error('Get post thread error:', error);
+			console.error('Get post thread error:', error.message);
 			return null;
 		}
 	}

@@ -125,6 +125,16 @@ GEMINI_MODEL = "gemini-2.5-flash-latest"  # 新しいモデル名に変更
 
 ## トラブルシューティング
 
+### CPU時間制限超過エラー
+
+Cloudflare無料プランのCPU時間制限（10ms）に対応するため、複数の最適化を実装しています。
+詳細は [PERFORMANCE_OPTIMIZATION.md](./PERFORMANCE_OPTIMIZATION.md) を参照してください。
+
+それでもCPU時間制限を超過する場合：
+- 有償プラン（$5/月、CPU時間50ms）へのアップグレードを検討
+- 画像処理の無効化（テキストのみ分析）
+- ローカル環境への移行
+
 ### セッションエラー
 
 KV Namespaceのセッション情報をクリア：
@@ -138,6 +148,18 @@ npx wrangler kv:key delete bsky_session --binding=EXERCISE_TRAINER_SESSIONS
 ```bash
 npx wrangler tail
 ```
+
+## パフォーマンス最適化
+
+このボットはCloudflareの無料プランで動作するよう最適化されています：
+
+- 画像サイズの削減（1600x1600px以下）
+- JPEG品質の調整（品質70-75）
+- 並列画像取得
+- ログ出力の最適化
+- クリーンアップ処理の間引き
+
+詳細は [PERFORMANCE_OPTIMIZATION.md](./PERFORMANCE_OPTIMIZATION.md) を参照してください。
 
 ## ライセンス
 
