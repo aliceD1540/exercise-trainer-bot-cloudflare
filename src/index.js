@@ -798,6 +798,10 @@ async function handleNotifications(env, bsky) {
 		
 		const processedNotifications = await getProcessedNotifications(env);
 		
+		// 24時間以内の通知のみ処理するための基準時刻を計算
+		const now = new Date();
+		const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+		
 		let newNotificationsCount = 0;
 		
 		for (const notification of notifications.data.notifications) {
@@ -809,6 +813,14 @@ async function handleNotifications(env, bsky) {
 			// CHECK_BSKY_DIDからの通知のみ処理
 			if (notification.author.did !== env.CHECK_BSKY_DID) {
 				continue;
+			}
+			
+			// 24時間以内のメンションのみ処理
+			if (notification.indexedAt) {
+				const notificationTime = new Date(notification.indexedAt);
+				if (notificationTime < twentyFourHoursAgo) {
+					continue;
+				}
 			}
 			
 			// 既に処理済みの通知はスキップ
