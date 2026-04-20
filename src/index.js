@@ -284,47 +284,64 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 		}
 	}
 
-	try {
-		const result = await model.generateContent(parts);
-		let responseText = result.response.text();
+	const maxRetries = 3;
+	const retryDelay = 2000;
+	
+	for (let attempt = 1; attempt <= maxRetries; attempt++) {
+		try {
+			const result = await model.generateContent(parts);
+			let responseText = result.response.text();
 
-		// 履歴情報を保存する必要がある場合は、レスポンスをパースして履歴情報を抽出
-		if (shouldSaveHistory) {
-			const parsed = parseAIResponse(responseText);
-			
-			// 投稿日時から計算した継続日数と運動記録日を使用
-			const history = {
-				lastTrainingDate: postData.calculatedExerciseDate,
-				consecutiveDays: postData.calculatedConsecutiveDays,
-				notes: parsed.history?.notes || ''
-			};
-			
-			await saveExerciseHistory(postData.author, history, env);
-			
-			responseText = parsed.displayText;
-		}
-
-		// 簡単な返答の場合は50文字、通常は300文字制限
-		const maxLength = isSimpleReply ? 50 : 300;
-		if (responseText.length > maxLength) {
-			responseText = responseText.substring(0, maxLength);
-			const lastPeriod = responseText.lastIndexOf('。');
-			if (lastPeriod !== -1) {
-				responseText = responseText.substring(0, lastPeriod + 1);
+			// 履歴情報を保存する必要がある場合は、レスポンスをパースして履歴情報を抽出
+			if (shouldSaveHistory) {
+				const parsed = parseAIResponse(responseText);
+				
+				// 投稿日時から計算した継続日数と運動記録日を使用
+				const history = {
+					lastTrainingDate: postData.calculatedExerciseDate,
+					consecutiveDays: postData.calculatedConsecutiveDays,
+					notes: parsed.history?.notes || ''
+				};
+				
+				await saveExerciseHistory(postData.author, history, env);
+				
+				responseText = parsed.displayText;
 			}
-		}
 
-		return responseText;
-	} catch (error) {
-		console.error('Gemini API error:', error);
-		
-		// モデルが見つからない場合やAPIエラーの場合
-		if (error.message && (error.message.includes('model') || error.message.includes('not found'))) {
-			throw new Error('AI_MODEL_NOT_AVAILABLE');
+			// 簡単な返答の場合は50文字、通常は300文字制限
+			const maxLength = isSimpleReply ? 50 : 300;
+			if (responseText.length > maxLength) {
+				responseText = responseText.substring(0, maxLength);
+				const lastPeriod = responseText.lastIndexOf('。');
+				if (lastPeriod !== -1) {
+					responseText = responseText.substring(0, lastPeriod + 1);
+				}
+			}
+
+			return responseText;
+		} catch (error) {
+			console.error(`Gemini API error (attempt ${attempt}/${maxRetries}):`, error);
+			
+			const errorMessage = error.message || '';
+			const is503Error = errorMessage.includes('503') || errorMessage.includes('Service Unavailable');
+			const isRateLimitError = errorMessage.includes('429') || errorMessage.includes('high demand');
+			
+			if ((is503Error || isRateLimitError) && attempt < maxRetries) {
+				const delay = retryDelay * attempt;
+				console.log(`Retrying after ${delay}ms due to temporary API issue...`);
+				await new Promise(resolve => setTimeout(resolve, delay));
+				continue;
+			}
+			
+			// モデルが見つからない場合やAPIエラーの場合
+			if (errorMessage.includes('model') || errorMessage.includes('not found')) {
+				console.error('AI model not available:', modelName);
+				throw new Error('AI_MODEL_NOT_AVAILABLE');
+			}
+			
+			// 最大リトライ回数に達した場合もエラーをスロー
+			throw error;
 		}
-		
-		// その他のエラー
-		throw error;
 	}
 }
 
@@ -647,25 +664,46 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 
 	const prompt = buildReminderPrompt(daysSince, formattedTime, timeOfDay);
 
-	try {
-		const result = await model.generateContent(prompt);
-		let responseText = result.response.text();
+	const maxRetries = 3;
+	const retryDelay = 2000;
+	
+	for (let attempt = 1; attempt <= maxRetries; attempt++) {
+		try {
+			const result = await model.generateContent(prompt);
+			let responseText = result.response.text();
 
-		// 300文字制限
-		if (responseText.length > 300) {
-			responseText = responseText.substring(0, 300);
-			const lastPeriod = responseText.lastIndexOf('。');
-			if (lastPeriod !== -1) {
-				responseText = responseText.substring(0, lastPeriod + 1);
+			// 300文字制限
+			if (responseText.length > 300) {
+				responseText = responseText.substring(0, 300);
+				const lastPeriod = responseText.lastIndexOf('。');
+				if (lastPeriod !== -1) {
+					responseText = responseText.substring(0, lastPeriod + 1);
+				}
 			}
-		}
 
-		return responseText;
-	} catch (error) {
-		console.error('Gemini API error for reminder:', error);
-		// フォールバック: シンプルなメッセージを返す
-		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
+			return responseText;
+		} catch (error) {
+			console.error(`Gemini API error for reminder (attempt ${attempt}/${maxRetries}):`, error);
+			
+			const errorMessage = error.message || '';
+			const is503Error = errorMessage.includes('503') || errorMessage.includes('Service Unavailable');
+			const isRateLimitError = errorMessage.includes('429') || errorMessage.includes('high demand');
+			
+			if ((is503Error || isRateLimitError) && attempt < maxRetries) {
+				const delay = retryDelay * attempt;
+				console.log(`Retrying reminder generation after ${delay}ms...`);
+				await new Promise(resolve => setTimeout(resolve, delay));
+				continue;
+			}
+			
+			// 最大リトライ回数に達した場合はフォールバック
+			console.error('Failed to generate reminder after all retries, using fallback message');
+			return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
+		}
 	}
+	
+	// ループを抜けた場合もフォールバック（念のため）
+	return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
 }
 
 // Botへの通知（メンション/リプライ）を処理
