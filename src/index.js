@@ -317,9 +317,11 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 		return responseText;
 	} catch (error) {
 		console.error('Gemini API error:', error);
+		const errorMessage = error.message || '';
+		const isModelNotFoundError = /404.*models\/[^/\s]+.*not found/i.test(errorMessage);
 		
-		// モデルが見つからない場合やAPIエラーの場合
-		if (error.message && (error.message.includes('model') || error.message.includes('not found'))) {
+		// モデルが見つからない場合
+		if (isModelNotFoundError) {
 			throw new Error('AI_MODEL_NOT_AVAILABLE');
 		}
 		
