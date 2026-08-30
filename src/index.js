@@ -10,6 +10,16 @@ const IMAGE_MAX_DIMENSION = 320;
 const IMAGE_GRID_MAX_DIMENSION = 800;
 const IMAGE_JPEG_QUALITY = 50;
 const POST_SEARCH_OVERLAP_MS = 60 * 60 * 1000;
+const GEMINI_COOLDOWN_KEY = 'gemini_cooldown_until';
+const GEMINI_COOLDOWN_MS = 60 * 60 * 1000;
+
+class GeminiCooldownError extends Error {
+	constructor(cooldownUntil) {
+		super('GEMINI_COOLDOWN_ACTIVE');
+		this.name = 'GeminiCooldownError';
+		this.cooldownUntil = cooldownUntil;
+	}
+}
 
 /**
  * 日本時間（JST）のDateオブジェクトを取得
@@ -106,6 +116,9 @@ export default {
 		try {
 			await handleScheduled(env);
 		} catch (error) {
+			if (error instanceof GeminiCooldownError) {
+				return;
+			}
 			console.error('Scheduled handler error:', error);
 		}
 	},
@@ -118,6 +131,8 @@ export default {
 async function handleScheduled(env) {
 	const bsky = new BlueskyUtil(env);
 	await bsky.loadSession();
+	const geminiState = await loadGeminiCooldownState(env);
+	assertGeminiAvailable(geminiState, { scope: 'scheduled-handler' });
 
 	const now = new Date();
 	const lastEvaluationTime = await getLastEvaluationTime(env);
@@ -136,7 +151,7 @@ async function handleScheduled(env) {
 	});
 
 	if (!posts || !posts.data || !posts.data.posts || !Array.isArray(posts.data.posts)) {
-		await checkAndSendReminder(env, bsky);
+		await checkAndSendReminder(env, bsky, geminiState);
 		return;
 	}
 
@@ -169,16 +184,12 @@ async function handleScheduled(env) {
 
 			let responseText;
 			try {
-				responseText = await analyzeWithGemini(postData, env);
+				responseText = await analyzeWithGemini(postData, env, geminiState);
 			} catch (error) {
-				// AIモデルが使用できない場合の専用メッセージ
-				if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
-					const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
-					responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
-					console.error('AI model not available:', modelName);
-				} else {
-					throw error;
+				if (error instanceof GeminiCooldownError) {
+					break;
 				}
+				throw error;
 			}
 			
 			await bsky.postReply(responseText, post.uri, post.cid);
@@ -203,13 +214,22 @@ async function handleScheduled(env) {
 	}
 
 	await saveProcessedEntries(processedPosts, env);
+
+	if (isGeminiCooldownActive(geminiState)) {
+		return;
+	}
 	
-	await handleNotifications(env, bsky);
+	await handleNotifications(env, bsky, geminiState);
 	
-	await checkAndSendReminder(env, bsky);
+	await checkAndSendReminder(env, bsky, geminiState);
 }
 
-async function analyzeWithGemini(postData, env, isSimpleReply = false) {
+async function analyzeWithGemini(postData, env, geminiState, isSimpleReply = false) {
+	assertGeminiAvailable(geminiState, {
+		scope: isSimpleReply ? 'simple-reply' : 'post-evaluation',
+		postUri: postData.uri,
+	});
+
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
 	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
 	
@@ -217,8 +237,12 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 	try {
 		model = genAI.getGenerativeModel({ model: modelName });
 	} catch (error) {
-		console.error('Failed to get AI model:', error);
-		throw new Error('AI_MODEL_NOT_AVAILABLE');
+		await activateGeminiCooldown(env, geminiState, error, {
+			scope: 'get-generative-model',
+			postUri: postData.uri,
+			modelName,
+		});
+		throw new GeminiCooldownError(geminiState.cooldownUntil);
 	}
 
 	// 日本時間を取得して時間帯を判定
@@ -251,8 +275,8 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 		const postDate = new Date(postData.created_at);
 		const jstPostDate = new Date(postDate.getTime() + 9 * 60 * 60 * 1000);
 		postData.calculatedExerciseDate = getExerciseDate(jstPostDate);
-		
 		const historyContext = buildHistoryContext(history, consecutiveDays);
+		prompt = buildEvaluationPrompt(postData.text, formattedTime, timeOfDay, historyContext);
 		prompt = buildEvaluationPrompt(postData.text, formattedTime, timeOfDay, historyContext);
 	}
 
@@ -293,8 +317,12 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 	}
 
 	try {
-		const result = await model.generateContent(parts);
-		let responseText = result.response.text();
+		let responseText = await generateTextFromGemini(model, parts, env, geminiState, {
+			scope: isSimpleReply ? 'simple-reply' : 'post-evaluation',
+			postUri: postData.uri,
+			hasImages: parts.length > 1,
+			modelName,
+		});
 
 		// 履歴情報を保存する必要がある場合は、レスポンスをパースして履歴情報を抽出
 		if (shouldSaveHistory) {
@@ -324,18 +352,115 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 
 		return responseText;
 	} catch (error) {
-		console.error('Gemini API error:', error);
-		const errorMessage = error.message || '';
-		const isModelNotFoundError = /404.*models\/[^/\s]+.*not found/i.test(errorMessage);
-		
-		// モデルが見つからない場合
-		if (isModelNotFoundError) {
-			throw new Error('AI_MODEL_NOT_AVAILABLE');
+		if (error instanceof GeminiCooldownError) {
+			throw error;
 		}
-		
-		// その他のエラー
+
+		logGeminiError(error, {
+			postUri: postData.uri,
+			hasImages: parts.length > 1,
+			action: 'skip-until-cooldown-expires',
+		});
 		throw error;
 	}
+}
+
+async function generateTextFromGemini(model, parts, env, geminiState, context = {}) {
+	const request = Array.isArray(parts)
+		? { contents: [{ role: 'user', parts }] }
+		: parts;
+
+	try {
+		const result = await model.generateContent(request);
+		return result.response.text();
+	} catch (error) {
+		await activateGeminiCooldown(env, geminiState, error, context);
+		throw new GeminiCooldownError(geminiState.cooldownUntil);
+	}
+}
+
+function logGeminiError(error, context = {}) {
+	const response = error?.response;
+	const firstCandidate = response?.candidates?.[0];
+	const details = {
+		message: 'Gemini API error',
+		error: error instanceof Error ? error.message : String(error),
+		status: typeof error?.status === 'number' ? error.status : null,
+		statusText: typeof error?.statusText === 'string' ? error.statusText : null,
+		errorDetails: error?.errorDetails ?? null,
+		promptFeedback: response?.promptFeedback ?? null,
+		finishReason: firstCandidate?.finishReason ?? null,
+		finishMessage: firstCandidate?.finishMessage ?? null,
+		...context,
+	};
+	console.error(JSON.stringify(details));
+}
+
+async function loadGeminiCooldownState(env) {
+	try {
+		const cooldownValue = await env.EXERCISE_TRAINER_SESSIONS.get(GEMINI_COOLDOWN_KEY);
+		if (!cooldownValue) {
+			return { cooldownUntil: null };
+		}
+
+		const cooldownUntil = new Date(cooldownValue);
+		if (Number.isNaN(cooldownUntil.getTime()) || cooldownUntil <= new Date()) {
+			return { cooldownUntil: null };
+		}
+
+		return { cooldownUntil };
+	} catch (error) {
+		console.error('Error loading Gemini cooldown:', error.message);
+		return { cooldownUntil: null };
+	}
+}
+
+function assertGeminiAvailable(geminiState, context = {}) {
+	if (!geminiState.cooldownUntil || geminiState.cooldownUntil <= new Date()) {
+		return;
+	}
+
+	console.log(JSON.stringify({
+		message: 'Skipping Gemini request during cooldown',
+		cooldownUntil: geminiState.cooldownUntil.toISOString(),
+		...context,
+	}));
+	throw new GeminiCooldownError(geminiState.cooldownUntil);
+}
+
+function isGeminiCooldownActive(geminiState) {
+	return !!geminiState.cooldownUntil && geminiState.cooldownUntil > new Date();
+}
+
+async function activateGeminiCooldown(env, geminiState, error, context = {}) {
+	const nextCooldownUntil = new Date(Date.now() + GEMINI_COOLDOWN_MS);
+	if (!geminiState.cooldownUntil || geminiState.cooldownUntil < nextCooldownUntil) {
+		geminiState.cooldownUntil = nextCooldownUntil;
+		try {
+			await env.EXERCISE_TRAINER_SESSIONS.put(GEMINI_COOLDOWN_KEY, nextCooldownUntil.toISOString());
+		} catch (kvError) {
+			console.error('Error saving Gemini cooldown:', kvError.message);
+		}
+	}
+
+	logGeminiError(error, {
+		...context,
+		action: 'activate-cooldown',
+		cooldownUntil: geminiState.cooldownUntil.toISOString(),
+	});
+}
+
+function truncateResponse(responseText, maxLength) {
+	if (responseText.length <= maxLength) {
+		return responseText;
+	}
+
+	let truncated = responseText.substring(0, maxLength);
+	const lastPeriod = truncated.lastIndexOf('。');
+	if (lastPeriod !== -1) {
+		truncated = truncated.substring(0, lastPeriod + 1);
+	}
+	return truncated;
 }
 
 function arrayBufferToBase64(buffer) {
@@ -595,7 +720,7 @@ async function getLastReminderTime(env) {
 }
 
 // リマインダーが必要かチェックして送信
-async function checkAndSendReminder(env, bsky) {
+async function checkAndSendReminder(env, bsky, geminiState) {
 	try {
 		const now = new Date();
 		const lastEvaluationTime = await getLastEvaluationTime(env);
@@ -620,8 +745,13 @@ async function checkAndSendReminder(env, bsky) {
 				return;
 			}
 		}
+
+		assertGeminiAvailable(geminiState, { scope: 'reminder' });
 		
-		const reminderText = await generateReminderMessage(env, hoursSinceEvaluation);
+		const reminderText = await generateReminderMessage(env, hoursSinceEvaluation, geminiState);
+		if (!reminderText) {
+			return;
+		}
 		
 		const profile = await bsky.getProfile(env.CHECK_BSKY_DID);
 		const handle = profile.data.handle;
@@ -631,12 +761,17 @@ async function checkAndSendReminder(env, bsky) {
 		
 		await updateLastReminderTime(now.toISOString(), env);
 	} catch (error) {
+		if (error instanceof GeminiCooldownError) {
+			return;
+		}
 		console.error('Error checking and sending reminder:', error.message);
 	}
 }
 
 // リマインダーメッセージを生成
-async function generateReminderMessage(env, hoursSinceEvaluation) {
+async function generateReminderMessage(env, hoursSinceEvaluation, geminiState) {
+	assertGeminiAvailable(geminiState, { scope: 'reminder' });
+
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
 	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
 	
@@ -644,9 +779,12 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 	try {
 		model = genAI.getGenerativeModel({ model: modelName });
 	} catch (error) {
-		console.error('Failed to get AI model:', error);
-		// フォールバック: シンプルなメッセージを返す
-		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
+		await activateGeminiCooldown(env, geminiState, error, {
+			scope: 'get-generative-model',
+			modelName,
+			requestType: 'reminder',
+		});
+		throw new GeminiCooldownError(geminiState.cooldownUntil);
 	}
 
 	// 日本時間を取得して時間帯を判定
@@ -658,29 +796,26 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 	const prompt = buildReminderPrompt(daysSince, formattedTime, timeOfDay);
 
 	try {
-		const result = await model.generateContent(prompt);
-		let responseText = result.response.text();
-
-		// 300文字制限
-		if (responseText.length > 300) {
-			responseText = responseText.substring(0, 300);
-			const lastPeriod = responseText.lastIndexOf('。');
-			if (lastPeriod !== -1) {
-				responseText = responseText.substring(0, lastPeriod + 1);
-			}
-		}
-
-		return responseText;
+		const responseText = await generateTextFromGemini(model, prompt, env, geminiState, {
+			scope: 'reminder',
+			modelName,
+			daysSince,
+		});
+		return truncateResponse(responseText, 300);
 	} catch (error) {
-		console.error('Gemini API error for reminder:', error);
-		// フォールバック: シンプルなメッセージを返す
-		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
+		if (error instanceof GeminiCooldownError) {
+			throw error;
+		}
+		logGeminiError(error, { scope: 'reminder', action: 'skip-until-cooldown-expires' });
+		throw error;
 	}
 }
 
 // Botへの通知（メンション/リプライ）を処理
-async function handleNotifications(env, bsky) {
+async function handleNotifications(env, bsky, geminiState) {
 	try {
+		assertGeminiAvailable(geminiState, { scope: 'notifications' });
+
 		// 通知取得も制限を削減
 		const notifications = await bsky.getNotifications({ limit: 20 });
 		
@@ -767,20 +902,16 @@ async function handleNotifications(env, bsky) {
 				try {
 					// ボットへのリプライ（会話の続き）なら簡単な返答を生成
 					if (isReplyToBot) {
-						responseText = await analyzeWithGemini(postData, env, true);
+						responseText = await analyzeWithGemini(postData, env, geminiState, true);
 					} else {
 						// 初回のメンションなら通常の評価
-						responseText = await analyzeWithGemini(postData, env, false);
+						responseText = await analyzeWithGemini(postData, env, geminiState, false);
 					}
 				} catch (error) {
-					// AIモデルが使用できない場合の専用メッセージ
-					if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
-						const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
-						responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
-						console.error('AI model not available:', modelName);
-					} else {
-						throw error;
+					if (error instanceof GeminiCooldownError) {
+						break;
 					}
+					throw error;
 				}
 				
 				await bsky.postReply(responseText, notification.uri, notification.cid, rootUri, rootCid);
@@ -796,6 +927,9 @@ async function handleNotifications(env, bsky) {
 		
 		await saveProcessedEntries(processedNotifications, env);
 	} catch (error) {
+		if (error instanceof GeminiCooldownError) {
+			return;
+		}
 		console.error('Error handling notifications:', error.message);
 	}
 }
