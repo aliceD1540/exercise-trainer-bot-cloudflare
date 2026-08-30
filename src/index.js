@@ -1,7 +1,15 @@
 import { BlueskyUtil } from './bluesky-util.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { PhotonImage, resize, SamplingFilter } from '@cf-wasm/photon';
+import { Buffer } from 'node:buffer';
 import { buildSimpleReplyPrompt, buildHistoryContext, buildEvaluationPrompt, buildReminderPrompt } from './prompts.js';
+
+const PROCESSED_RECORD_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const PROCESSED_RECORD_LIMIT = 500;
+const IMAGE_MAX_DIMENSION = 320;
+const IMAGE_GRID_MAX_DIMENSION = 800;
+const IMAGE_JPEG_QUALITY = 50;
+const POST_SEARCH_OVERLAP_MS = 60 * 60 * 1000;
 
 /**
  * 日本時間（JST）のDateオブジェクトを取得
@@ -111,9 +119,11 @@ async function handleScheduled(env) {
 	const bsky = new BlueskyUtil(env);
 	await bsky.loadSession();
 
-	// 現在時刻から24時間前まで検索範囲を拡大
 	const now = new Date();
-	const since = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+	const lastEvaluationTime = await getLastEvaluationTime(env);
+	const since = lastEvaluationTime
+		? new Date(lastEvaluationTime.getTime() - POST_SEARCH_OVERLAP_MS).toISOString()
+		: new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
 	const until = now.toISOString();
 
 	// 検索制限を削減してAPI呼び出しを軽量化
@@ -131,7 +141,7 @@ async function handleScheduled(env) {
 	}
 
 	// 処理済みポストのURIを取得
-	const processedPosts = await getProcessedPosts(env);
+	const processedPosts = await loadProcessedEntries('processed_posts', env);
 
 	let newPostsCount = 0;
 	let latestPostTime = null;
@@ -140,7 +150,7 @@ async function handleScheduled(env) {
 	
 	for (const post of posts.data.posts) {
 		// 既に処理済みのポストはスキップ
-		if (processedPosts.has(post.uri)) {
+		if (processedPosts.uris.has(post.uri)) {
 			continue;
 		}
 
@@ -154,7 +164,7 @@ async function handleScheduled(env) {
 
 			// 画像URLを取得
 			if (post.embed?.images) {
-				postData.images = post.embed.images.map(img => img.fullsize);
+				postData.images = post.embed.images.map(img => img.thumb ?? img.fullsize);
 			}
 
 			let responseText;
@@ -174,7 +184,7 @@ async function handleScheduled(env) {
 			await bsky.postReply(responseText, post.uri, post.cid);
 			
 			// 処理完了後、KVに記録
-			await markPostAsProcessed(post.uri, env);
+			markProcessedEntry(processedPosts, post.uri);
 			newPostsCount++;
 			
 			// 最新の投稿時刻を記録
@@ -191,12 +201,8 @@ async function handleScheduled(env) {
 	if (latestPostTime) {
 		await updateLastEvaluationTime(latestPostTime.toISOString(), env);
 	}
-	
-	// 10回に1回だけクリーンアップを実行してCPU時間削減
-	const shouldCleanup = Math.random() < 0.1;
-	if (shouldCleanup) {
-		await cleanupOldProcessedPosts(env);
-	}
+
+	await saveProcessedEntries(processedPosts, env);
 	
 	await handleNotifications(env, bsky);
 	
@@ -253,12 +259,14 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 	// 画像がある場合は画像も含めて送信
 	const parts = [{ text: prompt }];
 	
-	if (postData.images && postData.images.length > 0) {
+	if (!isSimpleReply && postData.images && postData.images.length > 0) {
 		try {
-			// 画像処理を並列化してCPU時間削減
 			const imagePromises = postData.images.slice(0, 4).map(async (imageUrl) => {
 				try {
 					const imageResponse = await fetch(imageUrl);
+					if (!imageResponse.ok) {
+						throw new Error(`Failed to fetch image: ${imageResponse.status}`);
+					}
 					return await imageResponse.arrayBuffer();
 				} catch (error) {
 					console.error('Error loading image:', error.message);
@@ -331,20 +339,11 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 }
 
 function arrayBufferToBase64(buffer) {
-	const bytes = new Uint8Array(buffer);
-	const chunkSize = 8192;
-	let binary = '';
-	
-	for (let i = 0; i < bytes.length; i += chunkSize) {
-		const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-		binary += String.fromCharCode.apply(null, chunk);
-	}
-	
-	return btoa(binary);
+	return Buffer.from(buffer).toString('base64');
 }
 
 // 画像をリサイズする関数（アスペクト比を維持）
-async function resizeImage(imageBuffer, maxWidth = 400, maxHeight = 400) {
+async function resizeImage(imageBuffer, maxWidth = IMAGE_MAX_DIMENSION, maxHeight = IMAGE_MAX_DIMENSION) {
 	try {
 		// バイト配列からPhotonImageを作成
 		const inputImage = PhotonImage.new_from_byteslice(new Uint8Array(imageBuffer));
@@ -374,8 +373,8 @@ async function resizeImage(imageBuffer, maxWidth = 400, maxHeight = 400) {
 		// リサイズ実行（Nearest: 高速、品質は中程度）
 		const outputImage = resize(inputImage, newWidth, newHeight, SamplingFilter.Nearest);
 		
-		// JPEG形式でエンコード（品質を60に下げて処理時間短縮）
-		const outputBytes = outputImage.get_bytes_jpeg(60);
+		// JPEG形式でエンコード（品質を下げて処理時間短縮）
+		const outputBytes = outputImage.get_bytes_jpeg(IMAGE_JPEG_QUALITY);
 		
 		// メモリ解放
 		inputImage.free();
@@ -394,7 +393,7 @@ async function createImageGrid(imageBuffers) {
 		const imageCount = imageBuffers.length;
 		
 		if (imageCount === 1) {
-			return imageBuffers[0];
+			return await resizeImage(imageBuffers[0]);
 		}
 		
 		const photonImages = imageBuffers.map(buffer => 
@@ -410,9 +409,8 @@ async function createImageGrid(imageBuffers) {
 			rows = 2;
 		}
 		
-		// グリッド全体を1200x1200に削減（CPU負荷軽減）
-		const maxCellWidth = Math.floor(1200 / cols);
-		const maxCellHeight = Math.floor(1200 / rows);
+		const maxCellWidth = Math.floor(IMAGE_GRID_MAX_DIMENSION / cols);
+		const maxCellHeight = Math.floor(IMAGE_GRID_MAX_DIMENSION / rows);
 		
 		const resizedImages = [];
 		for (let i = 0; i < photonImages.length; i++) {
@@ -476,8 +474,8 @@ async function createImageGrid(imageBuffers) {
 		
 		const gridImage = new PhotonImage(canvas, gridWidth, gridHeight);
 		
-		// 品質を60に下げて処理時間短縮
-		const outputBytes = gridImage.get_bytes_jpeg(60);
+		// 品質を下げて処理時間短縮
+		const outputBytes = gridImage.get_bytes_jpeg(IMAGE_JPEG_QUALITY);
 		
 		resizedImages.forEach(({ image }) => image.free());
 		gridImage.free();
@@ -489,60 +487,70 @@ async function createImageGrid(imageBuffers) {
 	}
 }
 
-// 処理済みポストのURIを取得
-async function getProcessedPosts(env) {
-	const processed = new Set();
-	
+async function loadProcessedEntries(key, env) {
 	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
-		if (processedData) {
-			const posts = JSON.parse(processedData);
-			posts.forEach(post => processed.add(post.uri));
-		}
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get(key);
+		const parsedEntries = processedData ? JSON.parse(processedData) : [];
+		const entries = pruneProcessedEntries(parsedEntries);
+		return {
+			key,
+			entries,
+			uris: new Set(entries.map((entry) => entry.uri)),
+			dirty: !!processedData && entries.length !== parsedEntries.length,
+		};
 	} catch (error) {
-		console.error('Error loading processed posts:', error);
-	}
-	
-	return processed;
-}
-
-// ポストを処理済みとしてマーク
-async function markPostAsProcessed(uri, env) {
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
-		const posts = processedData ? JSON.parse(processedData) : [];
-		
-		// 新しいポストを追加
-		posts.push({
-			uri,
-			processedAt: new Date().toISOString()
-		});
-		
-		await env.EXERCISE_TRAINER_SESSIONS.put('processed_posts', JSON.stringify(posts));
-	} catch (error) {
-		console.error('Error marking post as processed:', error);
+		console.error('Error loading processed entries:', error.message);
+		return {
+			key,
+			entries: [],
+			uris: new Set(),
+			dirty: false,
+		};
 	}
 }
 
-// 7日以上前の処理済み記録を削除
-async function cleanupOldProcessedPosts(env) {
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
-		if (!processedData) return;
-		
-		const posts = JSON.parse(processedData);
-		const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-		
-		// 7日以内の記録のみ残す
-		const recentPosts = posts.filter(post => 
-			new Date(post.processedAt) > sevenDaysAgo
-		);
-		
-		if (recentPosts.length !== posts.length) {
-			await env.EXERCISE_TRAINER_SESSIONS.put('processed_posts', JSON.stringify(recentPosts));
+function pruneProcessedEntries(entries) {
+	if (!Array.isArray(entries)) {
+		return [];
+	}
+
+	const cutoffTime = Date.now() - PROCESSED_RECORD_RETENTION_MS;
+	return entries
+		.filter((entry) => entry?.uri && entry?.processedAt && Date.parse(entry.processedAt) > cutoffTime)
+		.slice(-PROCESSED_RECORD_LIMIT);
+}
+
+function markProcessedEntry(tracker, uri) {
+	if (tracker.uris.has(uri)) {
+		return;
+	}
+
+	tracker.entries.push({
+		uri,
+		processedAt: new Date().toISOString(),
+	});
+	tracker.uris.add(uri);
+
+	if (tracker.entries.length > PROCESSED_RECORD_LIMIT) {
+		const overflow = tracker.entries.length - PROCESSED_RECORD_LIMIT;
+		const removedEntries = tracker.entries.splice(0, overflow);
+		for (const entry of removedEntries) {
+			tracker.uris.delete(entry.uri);
 		}
+	}
+
+	tracker.dirty = true;
+}
+
+async function saveProcessedEntries(tracker, env) {
+	if (!tracker.dirty) {
+		return;
+	}
+
+	try {
+		await env.EXERCISE_TRAINER_SESSIONS.put(tracker.key, JSON.stringify(tracker.entries));
 	} catch (error) {
-		console.error('Error cleaning up processed posts:', error);
+		console.error('Error saving processed entries:', error.message);
 	}
 }
 
@@ -680,7 +688,7 @@ async function handleNotifications(env, bsky) {
 			return;
 		}
 		
-		const processedNotifications = await getProcessedNotifications(env);
+		const processedNotifications = await loadProcessedEntries('processed_notifications', env);
 		
 		// 24時間以内の通知のみ処理するための基準時刻を計算
 		const now = new Date();
@@ -708,7 +716,7 @@ async function handleNotifications(env, bsky) {
 			}
 			
 			// 既に処理済みの通知はスキップ
-			if (processedNotifications.has(notification.uri)) {
+			if (processedNotifications.uris.has(notification.uri)) {
 				continue;
 			}
 			
@@ -753,7 +761,7 @@ async function handleNotifications(env, bsky) {
 				
 				// 画像URLを取得
 				if (notification.record.embed?.images) {
-					postData.images = notification.record.embed.images.map(img => img.fullsize);
+					postData.images = notification.record.embed.images.map(img => img.thumb ?? img.fullsize);
 				}
 				
 				try {
@@ -778,7 +786,7 @@ async function handleNotifications(env, bsky) {
 				await bsky.postReply(responseText, notification.uri, notification.cid, rootUri, rootCid);
 				
 				// 処理完了後、KVに記録
-				await markNotificationAsProcessed(notification.uri, env);
+				markProcessedEntry(processedNotifications, notification.uri);
 				newNotificationsCount++;
 				
 			} catch (error) {
@@ -786,70 +794,9 @@ async function handleNotifications(env, bsky) {
 			}
 		}
 		
-		// 10回に1回だけクリーンアップを実行
-		const shouldCleanup = Math.random() < 0.1;
-		if (shouldCleanup) {
-			await cleanupOldProcessedNotifications(env);
-		}
+		await saveProcessedEntries(processedNotifications, env);
 	} catch (error) {
 		console.error('Error handling notifications:', error.message);
-	}
-}
-
-// 処理済み通知のURIを取得
-async function getProcessedNotifications(env) {
-	const processed = new Set();
-	
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
-		if (processedData) {
-			const notifications = JSON.parse(processedData);
-			notifications.forEach(notification => processed.add(notification.uri));
-		}
-	} catch (error) {
-		console.error('Error loading processed notifications:', error);
-	}
-	
-	return processed;
-}
-
-// 通知を処理済みとしてマーク
-async function markNotificationAsProcessed(uri, env) {
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
-		const notifications = processedData ? JSON.parse(processedData) : [];
-		
-		// 新しい通知を追加
-		notifications.push({
-			uri,
-			processedAt: new Date().toISOString()
-		});
-		
-		await env.EXERCISE_TRAINER_SESSIONS.put('processed_notifications', JSON.stringify(notifications));
-	} catch (error) {
-		console.error('Error marking notification as processed:', error);
-	}
-}
-
-// 7日以上前の処理済み通知記録を削除
-async function cleanupOldProcessedNotifications(env) {
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
-		if (!processedData) return;
-		
-		const notifications = JSON.parse(processedData);
-		const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-		
-		// 7日以内の記録のみ残す
-		const recentNotifications = notifications.filter(notification => 
-			new Date(notification.processedAt) > sevenDaysAgo
-		);
-		
-		if (recentNotifications.length !== notifications.length) {
-			await env.EXERCISE_TRAINER_SESSIONS.put('processed_notifications', JSON.stringify(recentNotifications));
-		}
-	} catch (error) {
-		console.error('Error cleaning up processed notifications:', error);
 	}
 }
 
