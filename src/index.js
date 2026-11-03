@@ -1,7 +1,38 @@
 import { BlueskyUtil } from './bluesky-util.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI, GoogleGenerativeAIResponseError } from '@google/generative-ai';
 import { PhotonImage, resize, SamplingFilter } from '@cf-wasm/photon';
+import { Buffer } from 'node:buffer';
 import { buildSimpleReplyPrompt, buildHistoryContext, buildEvaluationPrompt, buildReminderPrompt } from './prompts.js';
+
+const PROCESSED_RECORD_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const PROCESSED_RECORD_LIMIT = 500;
+const IMAGE_MAX_DIMENSION = 320;
+const IMAGE_GRID_MAX_DIMENSION = 800;
+const IMAGE_JPEG_QUALITY = 50;
+const POST_SEARCH_OVERLAP_MS = 60 * 60 * 1000;
+const GEMINI_COOLDOWN_KEY = 'gemini_cooldown_until';
+const GEMINI_COOLDOWN_MS = 60 * 60 * 1000;
+const BSKY_POST_MAX_LENGTH = 300;
+const SIMPLE_REPLY_MAX_LENGTH = 50;
+// 休息日として扱い、継続が途切れないとみなす最大日数
+const MAX_REST_DAYS = 2;
+
+class GeminiCooldownError extends Error {
+	constructor(cooldownUntil) {
+		super('GEMINI_COOLDOWN_ACTIVE');
+		this.name = 'GeminiCooldownError';
+		this.cooldownUntil = cooldownUntil;
+	}
+}
+
+// 投稿内容に起因するGeminiエラー（再試行しても成功しないためクールダウン対象外）
+class GeminiPostError extends Error {
+	constructor(cause) {
+		super('GEMINI_POST_ERROR');
+		this.name = 'GeminiPostError';
+		this.cause = cause;
+	}
+}
 
 /**
  * 日本時間（JST）のDateオブジェクトを取得
@@ -84,12 +115,12 @@ function calculateConsecutiveDays(currentPostCreatedAt, lastTrainingDate, previo
 	const currentDate = new Date(currentExerciseDate + 'T00:00:00+09:00');
 	const daysDiff = Math.floor((currentDate - lastDate) / (24 * 60 * 60 * 1000));
 	
-	// 1日後なら継続日数を増やす
-	if (daysDiff === 1) {
+	// 翌日、または休息日（MAX_REST_DAYS日以内）を挟んだ場合は継続日数を増やす
+	if (daysDiff >= 1 && daysDiff <= MAX_REST_DAYS + 1) {
 		return previousConsecutiveDays + 1;
 	}
 	
-	// 2日以上空いた場合はリセット
+	// それ以上空いた場合はリセット
 	return 1;
 }
 
@@ -98,6 +129,9 @@ export default {
 		try {
 			await handleScheduled(env);
 		} catch (error) {
+			if (error instanceof GeminiCooldownError) {
+				return;
+			}
 			console.error('Scheduled handler error:', error);
 		}
 	},
@@ -109,11 +143,25 @@ export default {
 
 async function handleScheduled(env) {
 	const bsky = new BlueskyUtil(env);
-	await bsky.loadSession();
+	try {
+		await runScheduled(env, bsky);
+	} finally {
+		await bsky.flushSession();
+	}
+}
 
-	// 現在時刻から24時間前まで検索範囲を拡大
+async function runScheduled(env, bsky) {
+	if (!await bsky.loadSession()) {
+		throw new Error('Bluesky session is unavailable');
+	}
+	const geminiState = await loadGeminiCooldownState(env);
+	assertGeminiAvailable(geminiState, { scope: 'scheduled-handler' });
+
 	const now = new Date();
-	const since = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+	const lastEvaluationTime = await getLastEvaluationTime(env);
+	const since = lastEvaluationTime
+		? new Date(lastEvaluationTime.getTime() - POST_SEARCH_OVERLAP_MS).toISOString()
+		: new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
 	const until = now.toISOString();
 
 	// 検索制限を削減してAPI呼び出しを軽量化
@@ -126,21 +174,22 @@ async function handleScheduled(env) {
 	});
 
 	if (!posts || !posts.data || !posts.data.posts || !Array.isArray(posts.data.posts)) {
-		await checkAndSendReminder(env, bsky);
+		await checkAndSendReminder(env, bsky, geminiState);
 		return;
 	}
 
 	// 処理済みポストのURIを取得
-	const processedPosts = await getProcessedPosts(env);
+	// ハッシュタグ付きのメンションは検索と通知の両方に現れるため、両方の記録を参照して二重返信を防ぐ
+	const processedPosts = await loadProcessedEntries('processed_posts', env);
+	const processedNotifications = await loadProcessedEntries('processed_notifications', env);
 
-	let newPostsCount = 0;
 	let latestPostTime = null;
-	
+
 	// ハッシュタグ付き投稿の処理
-	
+
 	for (const post of posts.data.posts) {
 		// 既に処理済みのポストはスキップ
-		if (processedPosts.has(post.uri)) {
+		if (processedPosts.uris.has(post.uri) || processedNotifications.uris.has(post.uri)) {
 			continue;
 		}
 
@@ -150,33 +199,31 @@ async function handleScheduled(env) {
 				created_at: post.record.createdAt,
 				author: post.author.did,
 				uri: post.uri,
+				images: extractImageUrls(post.embed),
 			};
 
-			// 画像URLを取得
-			if (post.embed?.images) {
-				postData.images = post.embed.images.map(img => img.fullsize);
+			let result;
+			try {
+				result = await analyzeWithGemini(postData, env, geminiState);
+			} catch (error) {
+				if (error instanceof GeminiCooldownError) {
+					break;
+				}
+				if (error instanceof GeminiPostError) {
+					// 再試行しても成功しないため処理済みとして諦める
+					markProcessedEntry(processedPosts, post.uri);
+				}
+				throw error;
 			}
 
-			let responseText;
-			try {
-				responseText = await analyzeWithGemini(postData, env);
-			} catch (error) {
-				// AIモデルが使用できない場合の専用メッセージ
-				if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
-					const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
-					responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
-					console.error('AI model not available:', modelName);
-				} else {
-					throw error;
-				}
-			}
-			
-			await bsky.postReply(responseText, post.uri, post.cid);
-			
+			await bsky.postReply(result.text, post.uri, post.cid);
+
+			// 返信に成功してから履歴を保存する
+			await saveExerciseHistory(postData.author, result.history, env);
+
 			// 処理完了後、KVに記録
-			await markPostAsProcessed(post.uri, env);
-			newPostsCount++;
-			
+			markProcessedEntry(processedPosts, post.uri);
+
 			// 最新の投稿時刻を記録
 			const postTime = new Date(postData.created_at);
 			if (!latestPostTime || postTime > latestPostTime) {
@@ -186,24 +233,29 @@ async function handleScheduled(env) {
 			console.error('Error processing post:', error.message);
 		}
 	}
-	
-	
+
+
 	if (latestPostTime) {
 		await updateLastEvaluationTime(latestPostTime.toISOString(), env);
 	}
-	
-	// 10回に1回だけクリーンアップを実行してCPU時間削減
-	const shouldCleanup = Math.random() < 0.1;
-	if (shouldCleanup) {
-		await cleanupOldProcessedPosts(env);
+
+	await saveProcessedEntries(processedPosts, env);
+
+	if (isGeminiCooldownActive(geminiState)) {
+		return;
 	}
+
+	await handleNotifications(env, bsky, geminiState, processedPosts, processedNotifications);
 	
-	await handleNotifications(env, bsky);
-	
-	await checkAndSendReminder(env, bsky);
+	await checkAndSendReminder(env, bsky, geminiState);
 }
 
-async function analyzeWithGemini(postData, env, isSimpleReply = false) {
+async function analyzeWithGemini(postData, env, geminiState, isSimpleReply = false) {
+	assertGeminiAvailable(geminiState, {
+		scope: isSimpleReply ? 'simple-reply' : 'post-evaluation',
+		postUri: postData.uri,
+	});
+
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
 	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
 	
@@ -211,8 +263,12 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 	try {
 		model = genAI.getGenerativeModel({ model: modelName });
 	} catch (error) {
-		console.error('Failed to get AI model:', error);
-		throw new Error('AI_MODEL_NOT_AVAILABLE');
+		await activateGeminiCooldown(env, geminiState, error, {
+			scope: 'get-generative-model',
+			postUri: postData.uri,
+			modelName,
+		});
+		throw new GeminiCooldownError(geminiState.cooldownUntil);
 	}
 
 	// 日本時間を取得して時間帯を判定
@@ -245,7 +301,6 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 		const postDate = new Date(postData.created_at);
 		const jstPostDate = new Date(postDate.getTime() + 9 * 60 * 60 * 1000);
 		postData.calculatedExerciseDate = getExerciseDate(jstPostDate);
-		
 		const historyContext = buildHistoryContext(history, consecutiveDays);
 		prompt = buildEvaluationPrompt(postData.text, formattedTime, timeOfDay, historyContext);
 	}
@@ -253,12 +308,14 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 	// 画像がある場合は画像も含めて送信
 	const parts = [{ text: prompt }];
 	
-	if (postData.images && postData.images.length > 0) {
+	if (!isSimpleReply && postData.images && postData.images.length > 0) {
 		try {
-			// 画像処理を並列化してCPU時間削減
 			const imagePromises = postData.images.slice(0, 4).map(async (imageUrl) => {
 				try {
 					const imageResponse = await fetch(imageUrl);
+					if (!imageResponse.ok) {
+						throw new Error(`Failed to fetch image: ${imageResponse.status}`);
+					}
 					return await imageResponse.arrayBuffer();
 				} catch (error) {
 					console.error('Error loading image:', error.message);
@@ -284,78 +341,187 @@ async function analyzeWithGemini(postData, env, isSimpleReply = false) {
 		}
 	}
 
-	try {
-		const result = await model.generateContent(parts);
-		let responseText = result.response.text();
+	let responseText = await generateTextFromGemini(model, parts, env, geminiState, {
+		scope: isSimpleReply ? 'simple-reply' : 'post-evaluation',
+		postUri: postData.uri,
+		hasImages: parts.length > 1,
+		modelName,
+	});
 
-		// 履歴情報を保存する必要がある場合は、レスポンスをパースして履歴情報を抽出
-		if (shouldSaveHistory) {
-			const parsed = parseAIResponse(responseText);
-			
-			// 投稿日時から計算した継続日数と運動記録日を使用
-			const history = {
-				lastTrainingDate: postData.calculatedExerciseDate,
-				consecutiveDays: postData.calculatedConsecutiveDays,
-				notes: parsed.history?.notes || ''
-			};
-			
-			await saveExerciseHistory(postData.author, history, env);
-			
-			responseText = parsed.displayText;
-		}
+	// 履歴情報を保存する必要がある場合は、レスポンスをパースして履歴情報を抽出
+	// 保存は返信成功後に呼び出し側で行う
+	let history = null;
+	if (shouldSaveHistory) {
+		const parsed = parseAIResponse(responseText);
 
-		// 簡単な返答の場合は50文字、通常は300文字制限
-		const maxLength = isSimpleReply ? 50 : 300;
-		if (responseText.length > maxLength) {
-			responseText = responseText.substring(0, maxLength);
-			const lastPeriod = responseText.lastIndexOf('。');
-			if (lastPeriod !== -1) {
-				responseText = responseText.substring(0, lastPeriod + 1);
-			}
-		}
+		// 投稿日時から計算した継続日数と運動記録日を使用
+		history = {
+			lastTrainingDate: postData.calculatedExerciseDate,
+			consecutiveDays: postData.calculatedConsecutiveDays,
+			notes: parsed.history?.notes || ''
+		};
 
-		return responseText;
-	} catch (error) {
-		console.error('Gemini API error:', error);
-		const errorMessage = error.message || '';
-		const isModelNotFoundError = /404.*models\/[^/\s]+.*not found/i.test(errorMessage);
-		
-		// モデルが見つからない場合
-		if (isModelNotFoundError) {
-			throw new Error('AI_MODEL_NOT_AVAILABLE');
-		}
-		
-		// その他のエラー
-		throw error;
+		responseText = parsed.displayText;
 	}
+
+	const maxLength = isSimpleReply ? SIMPLE_REPLY_MAX_LENGTH : BSKY_POST_MAX_LENGTH;
+	return {
+		text: truncateResponse(responseText, maxLength),
+		history,
+	};
+}
+
+async function generateTextFromGemini(model, parts, env, geminiState, context = {}) {
+	const request = Array.isArray(parts)
+		? { contents: [{ role: 'user', parts }] }
+		: parts;
+
+	try {
+		const result = await model.generateContent(request);
+		return result.response.text();
+	} catch (error) {
+		if (isPostSpecificGeminiError(error)) {
+			logGeminiError(error, { ...context, action: 'skip-post' });
+			throw new GeminiPostError(error);
+		}
+		await activateGeminiCooldown(env, geminiState, error, context);
+		throw new GeminiCooldownError(geminiState.cooldownUntil);
+	}
+}
+
+// セーフティブロックや不正な入力など、投稿内容に起因して再試行しても成功しないエラーか判定
+// レート制限・サーバーエラー・認証/モデル設定エラーなどはクールダウン対象とする
+function isPostSpecificGeminiError(error) {
+	if (error instanceof GoogleGenerativeAIResponseError) {
+		return true;
+	}
+	if (error?.status !== 400) {
+		return false;
+	}
+	const reasons = Array.isArray(error.errorDetails)
+		? error.errorDetails.map((detail) => detail?.reason).filter(Boolean)
+		: [];
+	const isApiKeyError = reasons.some((reason) => reason.startsWith('API_KEY'))
+		|| /API[ _]key/i.test(error.message ?? '');
+	return !isApiKeyError;
+}
+
+function logGeminiError(error, context = {}) {
+	const response = error?.response;
+	const firstCandidate = response?.candidates?.[0];
+	const details = {
+		message: 'Gemini API error',
+		error: error instanceof Error ? error.message : String(error),
+		status: typeof error?.status === 'number' ? error.status : null,
+		statusText: typeof error?.statusText === 'string' ? error.statusText : null,
+		errorDetails: error?.errorDetails ?? null,
+		promptFeedback: response?.promptFeedback ?? null,
+		finishReason: firstCandidate?.finishReason ?? null,
+		finishMessage: firstCandidate?.finishMessage ?? null,
+		...context,
+	};
+	console.error(JSON.stringify(details));
+}
+
+async function loadGeminiCooldownState(env) {
+	try {
+		const cooldownValue = await env.EXERCISE_TRAINER_SESSIONS.get(GEMINI_COOLDOWN_KEY);
+		if (!cooldownValue) {
+			return { cooldownUntil: null };
+		}
+
+		const cooldownUntil = new Date(cooldownValue);
+		if (Number.isNaN(cooldownUntil.getTime()) || cooldownUntil <= new Date()) {
+			return { cooldownUntil: null };
+		}
+
+		return { cooldownUntil };
+	} catch (error) {
+		console.error('Error loading Gemini cooldown:', error.message);
+		return { cooldownUntil: null };
+	}
+}
+
+function assertGeminiAvailable(geminiState, context = {}) {
+	if (!geminiState.cooldownUntil || geminiState.cooldownUntil <= new Date()) {
+		return;
+	}
+
+	console.log(JSON.stringify({
+		message: 'Skipping Gemini request during cooldown',
+		cooldownUntil: geminiState.cooldownUntil.toISOString(),
+		...context,
+	}));
+	throw new GeminiCooldownError(geminiState.cooldownUntil);
+}
+
+function isGeminiCooldownActive(geminiState) {
+	return !!geminiState.cooldownUntil && geminiState.cooldownUntil > new Date();
+}
+
+async function activateGeminiCooldown(env, geminiState, error, context = {}) {
+	const nextCooldownUntil = new Date(Date.now() + GEMINI_COOLDOWN_MS);
+	if (!geminiState.cooldownUntil || geminiState.cooldownUntil < nextCooldownUntil) {
+		geminiState.cooldownUntil = nextCooldownUntil;
+		try {
+			await env.EXERCISE_TRAINER_SESSIONS.put(GEMINI_COOLDOWN_KEY, nextCooldownUntil.toISOString());
+		} catch (kvError) {
+			console.error('Error saving Gemini cooldown:', kvError.message);
+		}
+	}
+
+	logGeminiError(error, {
+		...context,
+		action: 'activate-cooldown',
+		cooldownUntil: geminiState.cooldownUntil.toISOString(),
+	});
+}
+
+function truncateResponse(responseText, maxLength) {
+	if (responseText.length <= maxLength) {
+		return responseText;
+	}
+
+	let truncated = responseText.substring(0, maxLength);
+	const lastPeriod = truncated.lastIndexOf('。');
+	if (lastPeriod !== -1) {
+		truncated = truncated.substring(0, lastPeriod + 1);
+	}
+	return truncated;
+}
+
+/**
+ * 投稿のembed（View形式）から画像URLを取得
+ * 画像のみの投稿と、引用＋画像の投稿（recordWithMedia）の両方に対応する
+ * @param {object|undefined} embed 投稿のembed（app.bsky.feed.defs#postView の embed）
+ * @returns {string[]} 画像URLの配列
+ */
+function extractImageUrls(embed) {
+	const images = embed?.images ?? embed?.media?.images;
+	if (!Array.isArray(images)) {
+		return [];
+	}
+	return images.map((img) => img.thumb ?? img.fullsize).filter(Boolean);
 }
 
 function arrayBufferToBase64(buffer) {
-	const bytes = new Uint8Array(buffer);
-	const chunkSize = 8192;
-	let binary = '';
-	
-	for (let i = 0; i < bytes.length; i += chunkSize) {
-		const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-		binary += String.fromCharCode.apply(null, chunk);
-	}
-	
-	return btoa(binary);
+	return Buffer.from(buffer).toString('base64');
 }
 
 // 画像をリサイズする関数（アスペクト比を維持）
-async function resizeImage(imageBuffer, maxWidth = 400, maxHeight = 400) {
+async function resizeImage(imageBuffer, maxWidth = IMAGE_MAX_DIMENSION, maxHeight = IMAGE_MAX_DIMENSION) {
+	let inputImage = null;
+	let outputImage = null;
 	try {
 		// バイト配列からPhotonImageを作成
-		const inputImage = PhotonImage.new_from_byteslice(new Uint8Array(imageBuffer));
-		
+		inputImage = PhotonImage.new_from_byteslice(new Uint8Array(imageBuffer));
+
 		// 元の画像サイズを取得
 		const originalWidth = inputImage.get_width();
 		const originalHeight = inputImage.get_height();
-		
+
 		// すでに小さい場合はリサイズしない
 		if (originalWidth <= maxWidth && originalHeight <= maxHeight) {
-			inputImage.free();
 			return imageBuffer;
 		}
 		
@@ -372,35 +538,39 @@ async function resizeImage(imageBuffer, maxWidth = 400, maxHeight = 400) {
 		}
 		
 		// リサイズ実行（Nearest: 高速、品質は中程度）
-		const outputImage = resize(inputImage, newWidth, newHeight, SamplingFilter.Nearest);
-		
-		// JPEG形式でエンコード（品質を60に下げて処理時間短縮）
-		const outputBytes = outputImage.get_bytes_jpeg(60);
-		
-		// メモリ解放
-		inputImage.free();
-		outputImage.free();
-		
+		outputImage = resize(inputImage, newWidth, newHeight, SamplingFilter.Nearest);
+
+		// JPEG形式でエンコード（品質を下げて処理時間短縮）
+		const outputBytes = outputImage.get_bytes_jpeg(IMAGE_JPEG_QUALITY);
+
 		return outputBytes.buffer;
 	} catch (error) {
 		console.error('Image resize failed:', error.message);
 		return imageBuffer;
+	} finally {
+		// 例外時も含めてWASMメモリを解放
+		inputImage?.free();
+		outputImage?.free();
 	}
 }
 
 // 複数の画像をグリッド化して1枚にまとめる関数
 async function createImageGrid(imageBuffers) {
+	const imageCount = imageBuffers.length;
+
+	if (imageCount === 1) {
+		return await resizeImage(imageBuffers[0]);
+	}
+
+	// 例外時にも解放できるよう、確保したPhotonImageを追跡する
+	const photonImages = [];
+	const resizedImages = [];
+	let gridImage = null;
 	try {
-		const imageCount = imageBuffers.length;
-		
-		if (imageCount === 1) {
-			return imageBuffers[0];
+		for (const buffer of imageBuffers) {
+			photonImages.push(PhotonImage.new_from_byteslice(new Uint8Array(buffer)));
 		}
-		
-		const photonImages = imageBuffers.map(buffer => 
-			PhotonImage.new_from_byteslice(new Uint8Array(buffer))
-		);
-		
+
 		let cols, rows;
 		if (imageCount === 2) {
 			cols = 2;
@@ -410,11 +580,9 @@ async function createImageGrid(imageBuffers) {
 			rows = 2;
 		}
 		
-		// グリッド全体を1200x1200に削減（CPU負荷軽減）
-		const maxCellWidth = Math.floor(1200 / cols);
-		const maxCellHeight = Math.floor(1200 / rows);
+		const maxCellWidth = Math.floor(IMAGE_GRID_MAX_DIMENSION / cols);
+		const maxCellHeight = Math.floor(IMAGE_GRID_MAX_DIMENSION / rows);
 		
-		const resizedImages = [];
 		for (let i = 0; i < photonImages.length; i++) {
 			const img = photonImages[i];
 			const originalWidth = img.get_width();
@@ -437,8 +605,10 @@ async function createImageGrid(imageBuffers) {
 				width: newWidth,
 				height: newHeight
 			});
-			
+
+			// メモリ使用量を抑えるため元画像は即座に解放する
 			img.free();
+			photonImages[i] = null;
 		}
 		
 		const gridWidth = maxCellWidth * cols;
@@ -474,75 +644,87 @@ async function createImageGrid(imageBuffers) {
 			}
 		}
 		
-		const gridImage = new PhotonImage(canvas, gridWidth, gridHeight);
-		
-		// 品質を60に下げて処理時間短縮
-		const outputBytes = gridImage.get_bytes_jpeg(60);
-		
-		resizedImages.forEach(({ image }) => image.free());
-		gridImage.free();
-		
+		gridImage = new PhotonImage(canvas, gridWidth, gridHeight);
+
+		// 品質を下げて処理時間短縮
+		const outputBytes = gridImage.get_bytes_jpeg(IMAGE_JPEG_QUALITY);
+
 		return outputBytes.buffer;
 	} catch (error) {
 		console.error('Grid creation failed:', error.message);
 		return imageBuffers[0];
+	} finally {
+		// 例外時も含めてWASMメモリを解放
+		photonImages.forEach((img) => img?.free());
+		resizedImages.forEach(({ image }) => image.free());
+		gridImage?.free();
 	}
 }
 
-// 処理済みポストのURIを取得
-async function getProcessedPosts(env) {
-	const processed = new Set();
-	
+async function loadProcessedEntries(key, env) {
 	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
-		if (processedData) {
-			const posts = JSON.parse(processedData);
-			posts.forEach(post => processed.add(post.uri));
+		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get(key);
+		const parsedEntries = processedData ? JSON.parse(processedData) : [];
+		const entries = pruneProcessedEntries(parsedEntries);
+		return {
+			key,
+			entries,
+			uris: new Set(entries.map((entry) => entry.uri)),
+			dirty: !!processedData && entries.length !== parsedEntries.length,
+		};
+	} catch (error) {
+		console.error('Error loading processed entries:', error.message);
+		return {
+			key,
+			entries: [],
+			uris: new Set(),
+			dirty: false,
+		};
+	}
+}
+
+function pruneProcessedEntries(entries) {
+	if (!Array.isArray(entries)) {
+		return [];
+	}
+
+	const cutoffTime = Date.now() - PROCESSED_RECORD_RETENTION_MS;
+	return entries
+		.filter((entry) => entry?.uri && entry?.processedAt && Date.parse(entry.processedAt) > cutoffTime)
+		.slice(-PROCESSED_RECORD_LIMIT);
+}
+
+function markProcessedEntry(tracker, uri) {
+	if (tracker.uris.has(uri)) {
+		return;
+	}
+
+	tracker.entries.push({
+		uri,
+		processedAt: new Date().toISOString(),
+	});
+	tracker.uris.add(uri);
+
+	if (tracker.entries.length > PROCESSED_RECORD_LIMIT) {
+		const overflow = tracker.entries.length - PROCESSED_RECORD_LIMIT;
+		const removedEntries = tracker.entries.splice(0, overflow);
+		for (const entry of removedEntries) {
+			tracker.uris.delete(entry.uri);
 		}
-	} catch (error) {
-		console.error('Error loading processed posts:', error);
 	}
-	
-	return processed;
+
+	tracker.dirty = true;
 }
 
-// ポストを処理済みとしてマーク
-async function markPostAsProcessed(uri, env) {
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
-		const posts = processedData ? JSON.parse(processedData) : [];
-		
-		// 新しいポストを追加
-		posts.push({
-			uri,
-			processedAt: new Date().toISOString()
-		});
-		
-		await env.EXERCISE_TRAINER_SESSIONS.put('processed_posts', JSON.stringify(posts));
-	} catch (error) {
-		console.error('Error marking post as processed:', error);
+async function saveProcessedEntries(tracker, env) {
+	if (!tracker.dirty) {
+		return;
 	}
-}
 
-// 7日以上前の処理済み記録を削除
-async function cleanupOldProcessedPosts(env) {
 	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_posts');
-		if (!processedData) return;
-		
-		const posts = JSON.parse(processedData);
-		const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-		
-		// 7日以内の記録のみ残す
-		const recentPosts = posts.filter(post => 
-			new Date(post.processedAt) > sevenDaysAgo
-		);
-		
-		if (recentPosts.length !== posts.length) {
-			await env.EXERCISE_TRAINER_SESSIONS.put('processed_posts', JSON.stringify(recentPosts));
-		}
+		await env.EXERCISE_TRAINER_SESSIONS.put(tracker.key, JSON.stringify(tracker.entries));
 	} catch (error) {
-		console.error('Error cleaning up processed posts:', error);
+		console.error('Error saving processed entries:', error.message);
 	}
 }
 
@@ -587,7 +769,7 @@ async function getLastReminderTime(env) {
 }
 
 // リマインダーが必要かチェックして送信
-async function checkAndSendReminder(env, bsky) {
+async function checkAndSendReminder(env, bsky, geminiState) {
 	try {
 		const now = new Date();
 		const lastEvaluationTime = await getLastEvaluationTime(env);
@@ -612,23 +794,38 @@ async function checkAndSendReminder(env, bsky) {
 				return;
 			}
 		}
-		
-		const reminderText = await generateReminderMessage(env, hoursSinceEvaluation);
+
+		assertGeminiAvailable(geminiState, { scope: 'reminder' });
 		
 		const profile = await bsky.getProfile(env.CHECK_BSKY_DID);
-		const handle = profile.data.handle;
-		
-		const messageWithMention = `@${handle} ${reminderText}`;
-		await bsky.postText(messageWithMention);
+		const mention = `@${profile.data.handle} `;
+
+		// メンション分を差し引いて投稿の文字数制限に収める
+		const reminderText = await generateReminderMessage(
+			env,
+			hoursSinceEvaluation,
+			geminiState,
+			BSKY_POST_MAX_LENGTH - mention.length
+		);
+		if (!reminderText) {
+			return;
+		}
+
+		await bsky.postText(mention + reminderText);
 		
 		await updateLastReminderTime(now.toISOString(), env);
 	} catch (error) {
+		if (error instanceof GeminiCooldownError) {
+			return;
+		}
 		console.error('Error checking and sending reminder:', error.message);
 	}
 }
 
 // リマインダーメッセージを生成
-async function generateReminderMessage(env, hoursSinceEvaluation) {
+async function generateReminderMessage(env, hoursSinceEvaluation, geminiState, maxLength) {
+	assertGeminiAvailable(geminiState, { scope: 'reminder' });
+
 	const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
 	const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
 	
@@ -636,9 +833,12 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 	try {
 		model = genAI.getGenerativeModel({ model: modelName });
 	} catch (error) {
-		console.error('Failed to get AI model:', error);
-		// フォールバック: シンプルなメッセージを返す
-		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
+		await activateGeminiCooldown(env, geminiState, error, {
+			scope: 'get-generative-model',
+			modelName,
+			requestType: 'reminder',
+		});
+		throw new GeminiCooldownError(geminiState.cooldownUntil);
 	}
 
 	// 日本時間を取得して時間帯を判定
@@ -649,30 +849,19 @@ async function generateReminderMessage(env, hoursSinceEvaluation) {
 
 	const prompt = buildReminderPrompt(daysSince, formattedTime, timeOfDay);
 
-	try {
-		const result = await model.generateContent(prompt);
-		let responseText = result.response.text();
-
-		// 300文字制限
-		if (responseText.length > 300) {
-			responseText = responseText.substring(0, 300);
-			const lastPeriod = responseText.lastIndexOf('。');
-			if (lastPeriod !== -1) {
-				responseText = responseText.substring(0, lastPeriod + 1);
-			}
-		}
-
-		return responseText;
-	} catch (error) {
-		console.error('Gemini API error for reminder:', error);
-		// フォールバック: シンプルなメッセージを返す
-		return 'お久しぶりです！最近お身体の調子はいかがですか？無理のない範囲で、また一緒にトレーニングしましょう！';
-	}
+	const responseText = await generateTextFromGemini(model, prompt, env, geminiState, {
+		scope: 'reminder',
+		modelName,
+		daysSince,
+	});
+	return truncateResponse(responseText, maxLength);
 }
 
 // Botへの通知（メンション/リプライ）を処理
-async function handleNotifications(env, bsky) {
+async function handleNotifications(env, bsky, geminiState, processedPosts, processedNotifications) {
 	try {
+		assertGeminiAvailable(geminiState, { scope: 'notifications' });
+
 		// 通知取得も制限を削減
 		const notifications = await bsky.getNotifications({ limit: 20 });
 		
@@ -680,14 +869,10 @@ async function handleNotifications(env, bsky) {
 			return;
 		}
 		
-		const processedNotifications = await getProcessedNotifications(env);
-		
 		// 24時間以内の通知のみ処理するための基準時刻を計算
 		const now = new Date();
 		const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-		
-		let newNotificationsCount = 0;
-		
+
 		for (const notification of notifications.data.notifications) {
 			// mention または reply のみ処理
 			if (notification.reason !== 'mention' && notification.reason !== 'reply') {
@@ -707,21 +892,25 @@ async function handleNotifications(env, bsky) {
 				}
 			}
 			
-			// 既に処理済みの通知はスキップ
-			if (processedNotifications.has(notification.uri)) {
+			// 既に処理済みの通知はスキップ（ハッシュタグ投稿として返信済みのものも含む）
+			if (processedNotifications.uris.has(notification.uri) || processedPosts.uris.has(notification.uri)) {
 				continue;
 			}
-			
+
 			try {
 				// スレッド情報を取得してroot参照を正しく設定し、会話の文脈を判断
 				let rootUri = null;
 				let rootCid = null;
 				let isReplyToBot = false;
-				
+				let images = [];
+
 				const threadInfo = await bsky.getPostThread(notification.uri);
 				if (threadInfo && threadInfo.data && threadInfo.data.thread) {
 					const thread = threadInfo.data.thread;
-					
+
+					// notification.record は生のレコードで画像URLを持たないため、View形式のembedから取得する
+					images = extractImageUrls(thread.post?.embed);
+
 					// スレッドのrootを取得
 					if (thread.post && thread.post.record && thread.post.record.reply) {
 						// この投稿自体がリプライの場合、rootを使用
@@ -741,115 +930,49 @@ async function handleNotifications(env, bsky) {
 					}
 				}
 				
-				let responseText;
-				
 				// 投稿データを準備
 				const postData = {
 					text: notification.record.text,
 					created_at: notification.record.createdAt,
 					author: notification.author.did,
 					uri: notification.uri,
+					images,
 				};
-				
-				// 画像URLを取得
-				if (notification.record.embed?.images) {
-					postData.images = notification.record.embed.images.map(img => img.fullsize);
-				}
-				
+
+				let result;
 				try {
-					// ボットへのリプライ（会話の続き）なら簡単な返答を生成
-					if (isReplyToBot) {
-						responseText = await analyzeWithGemini(postData, env, true);
-					} else {
-						// 初回のメンションなら通常の評価
-						responseText = await analyzeWithGemini(postData, env, false);
-					}
+					// ボットへのリプライ（会話の続き）なら簡単な返答、初回のメンションなら通常の評価
+					result = await analyzeWithGemini(postData, env, geminiState, isReplyToBot);
 				} catch (error) {
-					// AIモデルが使用できない場合の専用メッセージ
-					if (error.message === 'AI_MODEL_NOT_AVAILABLE') {
-						const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
-						responseText = `申し訳ございません。現在使用しているAIモデル（${modelName}）が利用できなくなっています。\n\nボットの管理者に連絡し、AIモデルの設定を更新する必要があります。しばらくお待ちください。`;
-						console.error('AI model not available:', modelName);
-					} else {
-						throw error;
+					if (error instanceof GeminiCooldownError) {
+						break;
 					}
+					if (error instanceof GeminiPostError) {
+						// 再試行しても成功しないため処理済みとして諦める
+						markProcessedEntry(processedNotifications, notification.uri);
+					}
+					throw error;
 				}
-				
-				await bsky.postReply(responseText, notification.uri, notification.cid, rootUri, rootCid);
-				
+
+				await bsky.postReply(result.text, notification.uri, notification.cid, rootUri, rootCid);
+
+				// 返信に成功してから履歴を保存する
+				await saveExerciseHistory(postData.author, result.history, env);
+
 				// 処理完了後、KVに記録
-				await markNotificationAsProcessed(notification.uri, env);
-				newNotificationsCount++;
-				
+				markProcessedEntry(processedNotifications, notification.uri);
+
 			} catch (error) {
 				console.error('Error processing notification:', error);
 			}
 		}
 		
-		// 10回に1回だけクリーンアップを実行
-		const shouldCleanup = Math.random() < 0.1;
-		if (shouldCleanup) {
-			await cleanupOldProcessedNotifications(env);
-		}
+		await saveProcessedEntries(processedNotifications, env);
 	} catch (error) {
+		if (error instanceof GeminiCooldownError) {
+			return;
+		}
 		console.error('Error handling notifications:', error.message);
-	}
-}
-
-// 処理済み通知のURIを取得
-async function getProcessedNotifications(env) {
-	const processed = new Set();
-	
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
-		if (processedData) {
-			const notifications = JSON.parse(processedData);
-			notifications.forEach(notification => processed.add(notification.uri));
-		}
-	} catch (error) {
-		console.error('Error loading processed notifications:', error);
-	}
-	
-	return processed;
-}
-
-// 通知を処理済みとしてマーク
-async function markNotificationAsProcessed(uri, env) {
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
-		const notifications = processedData ? JSON.parse(processedData) : [];
-		
-		// 新しい通知を追加
-		notifications.push({
-			uri,
-			processedAt: new Date().toISOString()
-		});
-		
-		await env.EXERCISE_TRAINER_SESSIONS.put('processed_notifications', JSON.stringify(notifications));
-	} catch (error) {
-		console.error('Error marking notification as processed:', error);
-	}
-}
-
-// 7日以上前の処理済み通知記録を削除
-async function cleanupOldProcessedNotifications(env) {
-	try {
-		const processedData = await env.EXERCISE_TRAINER_SESSIONS.get('processed_notifications');
-		if (!processedData) return;
-		
-		const notifications = JSON.parse(processedData);
-		const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-		
-		// 7日以内の記録のみ残す
-		const recentNotifications = notifications.filter(notification => 
-			new Date(notification.processedAt) > sevenDaysAgo
-		);
-		
-		if (recentNotifications.length !== notifications.length) {
-			await env.EXERCISE_TRAINER_SESSIONS.put('processed_notifications', JSON.stringify(recentNotifications));
-		}
-	} catch (error) {
-		console.error('Error cleaning up processed notifications:', error);
 	}
 }
 
@@ -880,6 +1003,10 @@ async function getExerciseHistory(did, env) {
 }
 
 async function saveExerciseHistory(did, history, env) {
+	// 簡単な返答など、保存すべき履歴がない場合は何もしない
+	if (!history) {
+		return;
+	}
 	try {
 		const key = `exercise_history_${did}`;
 		await env.EXERCISE_TRAINER_SESSIONS.put(key, JSON.stringify(history));
