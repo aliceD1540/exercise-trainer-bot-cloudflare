@@ -3,16 +3,33 @@ import { AtpAgent, RichText } from '@atproto/api';
 export class BlueskyUtil {
 	constructor(env) {
 		this.env = env;
+		this.pendingSessionWrite = Promise.resolve();
 		this.agent = new AtpAgent({
 			service: 'https://bsky.social',
+			// トークンのリフレッシュ時にも最新のセッションをKVへ保存する
+			persistSession: (evt, session) => this.handleSessionEvent(evt, session),
 		});
 	}
 
-	async saveSession() {
-		const session = this.agent.session;
-		if (session) {
-			await this.env.EXERCISE_TRAINER_SESSIONS.put('bsky_session', JSON.stringify(session));
+	handleSessionEvent(evt, session) {
+		let write;
+		if ((evt === 'create' || evt === 'update') && session) {
+			write = () => this.env.EXERCISE_TRAINER_SESSIONS.put('bsky_session', JSON.stringify(session));
+		} else if (evt === 'expired') {
+			write = () => this.env.EXERCISE_TRAINER_SESSIONS.delete('bsky_session');
+		} else {
+			return;
 		}
+
+		// 書き込み順を保証するために直列化する
+		this.pendingSessionWrite = this.pendingSessionWrite
+			.then(write)
+			.catch((error) => console.error('Failed to persist session:', error.message));
+	}
+
+	// 未完了のセッション保存を待つ（Worker終了前に呼ぶ）
+	async flushSession() {
+		await this.pendingSessionWrite;
 	}
 
 	async loadSession() {
@@ -37,7 +54,6 @@ export class BlueskyUtil {
 				identifier: this.env.BSKY_USER_NAME,
 				password: this.env.BSKY_APP_PASS,
 			});
-			await this.saveSession();
 			return true;
 		} catch (error) {
 			console.error('Failed to create session:', error.message);
