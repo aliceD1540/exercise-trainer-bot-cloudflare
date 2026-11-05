@@ -4,6 +4,8 @@ export class BlueskyUtil {
 	constructor(env) {
 		this.env = env;
 		this.pendingSessionWrite = Promise.resolve();
+		// KVに保存済みのトークン（変更がなければ書き込みを省略するために使う）
+		this.persistedTokens = null;
 		this.agent = new AtpAgent({
 			service: 'https://bsky.social',
 			// トークンのリフレッシュ時にも最新のセッションをKVへ保存する
@@ -14,8 +16,16 @@ export class BlueskyUtil {
 	handleSessionEvent(evt, session) {
 		let write;
 		if ((evt === 'create' || evt === 'update') && session) {
-			write = () => this.env.EXERCISE_TRAINER_SESSIONS.put('bsky_session', JSON.stringify(session));
+			// resumeSession は成功するたびに 'update' を通知するため、
+			// トークンが変わっていない場合はKVへの書き込みを省略する（KVの書き込み上限対策）
+			if (this.isPersisted(session)) {
+				return;
+			}
+			const sessionStr = JSON.stringify(session);
+			this.persistedTokens = { accessJwt: session.accessJwt, refreshJwt: session.refreshJwt };
+			write = () => this.env.EXERCISE_TRAINER_SESSIONS.put('bsky_session', sessionStr);
 		} else if (evt === 'expired') {
+			this.persistedTokens = null;
 			write = () => this.env.EXERCISE_TRAINER_SESSIONS.delete('bsky_session');
 		} else {
 			return;
@@ -25,6 +35,12 @@ export class BlueskyUtil {
 		this.pendingSessionWrite = this.pendingSessionWrite
 			.then(write)
 			.catch((error) => console.error('Failed to persist session:', error.message));
+	}
+
+	isPersisted(session) {
+		return !!this.persistedTokens
+			&& this.persistedTokens.accessJwt === session.accessJwt
+			&& this.persistedTokens.refreshJwt === session.refreshJwt;
 	}
 
 	// 未完了のセッション保存を待つ（Worker終了前に呼ぶ）
@@ -38,6 +54,8 @@ export class BlueskyUtil {
 			
 			if (sessionStr) {
 				const session = JSON.parse(sessionStr);
+				// resumeSession はリフレッシュ時に session を直接書き換えるため、読み込み時点の値を控えておく
+				this.persistedTokens = { accessJwt: session.accessJwt, refreshJwt: session.refreshJwt };
 				await this.agent.resumeSession(session);
 				return true;
 			}
